@@ -174,6 +174,49 @@ count := res.Len()
 - **Connection pooling** via `sqlitex.Pool` / `sqlitemigration.Pool` for concurrent access.
 - **Single package**: everything lives in `package graph` at the module root.
 
+## Benchmarks
+
+```
+go test -bench=. -benchmem ./...
+```
+
+Results on Apple M3 Max:
+
+```
+BenchmarkTraversalChain/hops=1      37976     31510 ns/op     2707 B/op     61 allocs/op
+BenchmarkTraversalChain/hops=2      15195     79016 ns/op     4170 B/op     70 allocs/op
+BenchmarkTraversalChain/hops=3      12860     93882 ns/op     4917 B/op     86 allocs/op
+BenchmarkTraversalChain/hops=5      10000    115139 ns/op     6408 B/op    117 allocs/op
+BenchmarkTraversalChain/hops=10      6820    175823 ns/op    10102 B/op    194 allocs/op
+
+BenchmarkTraversalFanout/depth=2    18614     64336 ns/op    11518 B/op    217 allocs/op  (13 nodes)
+BenchmarkTraversalFanout/depth=4      926   1307569 ns/op    92186 B/op   1840 allocs/op  (121 nodes)
+BenchmarkTraversalFanout/depth=6       12  93185375 ns/op   828125 B/op  16426 allocs/op  (1093 nodes)
+
+BenchmarkTraversalDense/hops=1       3205    378662 ns/op     5734 B/op    129 allocs/op  (500 nodes, 5 edges/node)
+BenchmarkTraversalDense/hops=2        220   5481183 ns/op    25130 B/op    524 allocs/op
+BenchmarkTraversalDense/hops=3         45  25483407 ns/op   104028 B/op   2218 allocs/op
+BenchmarkTraversalDense/hops=5          5 209771308 ns/op   366190 B/op   7815 allocs/op
+BenchmarkTraversalDense/hops=10         2 931694438 ns/op   375852 B/op   8013 allocs/op
+
+BenchmarkCreateNode                 78876     15556 ns/op     1817 B/op     38 allocs/op
+BenchmarkCreateEdge                 83337     15518 ns/op      818 B/op     19 allocs/op
+BenchmarkBulkInsertTx/batch=10       6548    204779 ns/op    14577 B/op    382 allocs/op
+BenchmarkBulkInsertTx/batch=100       715   1800590 ns/op   141614 B/op   3801 allocs/op
+BenchmarkBulkInsertTx/batch=1000       70  16154103 ns/op  1437031 B/op  39484 allocs/op
+
+BenchmarkMatchSimple/nodes=100      51266     23259 ns/op     1525 B/op     29 allocs/op
+BenchmarkMatchSimple/nodes=1000      7406    164950 ns/op     1523 B/op     29 allocs/op
+BenchmarkMatchSimple/nodes=10000      786   1526852 ns/op     1526 B/op     29 allocs/op
+```
+
+Key takeaways:
+- **Chain traversal** scales linearly with hop depth (~31us at 1 hop to ~176us at 10 hops on a 100-node chain).
+- **Fanout traversal** scales with the number of nodes reached; a depth-6 tree with fanout 3 (1093 nodes) takes ~93ms.
+- **Dense graph traversal** is the most expensive — on a 500-node graph with 5 edges/node, the reachable set explodes quickly. The `UNION` deduplication in the CTE prevents infinite loops but can't prevent visiting the full reachable set.
+- **Simple match** scales linearly with table size (SQLite index scan).
+- **Bulk insert** throughput is ~16ms for 1000 nodes+edges in a single transaction (~62k inserts/sec).
+
 ## License
 
 BSD-3-Clause
