@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -306,6 +308,19 @@ func BenchmarkBulkInsertTx(b *testing.B) {
 	}
 }
 
+// openBenchGraphFile opens a file-backed graph for benchmarks that need WAL
+// and concurrent access. WAL mode does not work on :memory: databases.
+func openBenchGraphFile(b *testing.B) *Graph {
+	b.Helper()
+	dbPath := filepath.Join(b.TempDir(), "bench.db")
+	g, err := Open(dbPath, &Options{PoolSize: 10})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { g.Close() })
+	return g
+}
+
 // BenchmarkMatchSimple measures simple label match (no traversal) on a graph
 // with varying node counts.
 func BenchmarkMatchSimple(b *testing.B) {
@@ -337,5 +352,150 @@ func BenchmarkMatchSimple(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkMatchByName measures point lookup by name across varying table sizes.
+// This is the exact pattern the idx_nodes_name index optimizes: on tuning the
+// query uses an index seek; on main it requires a full table scan.
+func BenchmarkMatchByName(b *testing.B) {
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("nodes=%d", n), func(b *testing.B) {
+			g := openBenchGraph(b)
+			ctx := context.Background()
+
+			for i := range n {
+				node := &Node{
+					Name:   fmt.Sprintf("n%d", i),
+					Labels: []string{"Person"},
+				}
+				if err := g.CreateNode(ctx, node); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			// Lookup a name in the middle of the range.
+			target := fmt.Sprintf("n%d", n/2)
+
+			b.ResetTimer()
+			for range b.N {
+				res, err := g.Match("Person").
+					Where("name", "=", target).
+					Run(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Len() != 1 {
+					b.Fatalf("expected 1 result, got %d", res.Len())
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkConcurrentReads measures parallel read throughput on a file-backed
+// graph. WAL mode allows concurrent readers; the rollback journal serializes them.
+func BenchmarkConcurrentReads(b *testing.B) {
+	g := openBenchGraphFile(b)
+	ctx := context.Background()
+
+	const nNodes = 1000
+	for i := range nNodes {
+		if err := g.CreateNode(ctx, &Node{
+			Name:   fmt.Sprintf("n%d", i),
+			Labels: []string{"Node"},
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(rand.Int63()))
+		for pb.Next() {
+			name := fmt.Sprintf("n%d", rng.Intn(nNodes))
+			res, err := g.Match("Node").
+				Where("name", "=", name).
+				Run(ctx)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if res.Len() != 1 {
+				b.Fatalf("expected 1 result for %s, got %d", name, res.Len())
+			}
+		}
+	})
+}
+
+// BenchmarkConcurrentReadWrite measures mixed read/write throughput on a
+// file-backed graph. ~80% of goroutines read and ~20% write new nodes.
+// Without busy_timeout, writers get immediate SQLITE_BUSY on contention.
+// With tuning, writers retry up to 5s and readers proceed concurrently.
+func BenchmarkConcurrentReadWrite(b *testing.B) {
+	g := openBenchGraphFile(b)
+	ctx := context.Background()
+
+	const nNodes = 1000
+	for i := range nNodes {
+		if err := g.CreateNode(ctx, &Node{
+			Name:   fmt.Sprintf("n%d", i),
+			Labels: []string{"Node"},
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	var writeCounter atomic.Int64
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(rand.Int63()))
+		for pb.Next() {
+			if rng.Intn(5) == 0 {
+				// ~20% writes
+				id := writeCounter.Add(1)
+				if err := g.CreateNode(ctx, &Node{
+					Name:   fmt.Sprintf("w%d", id),
+					Labels: []string{"Node"},
+				}); err != nil {
+					b.Fatal(err)
+				}
+			} else {
+				// ~80% reads
+				name := fmt.Sprintf("n%d", rng.Intn(nNodes))
+				res, err := g.Match("Node").
+					Where("name", "=", name).
+					Run(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Len() < 1 {
+					b.Fatalf("expected >=1 result for %s, got %d", name, res.Len())
+				}
+			}
+		}
+	})
+}
+
+// BenchmarkTraversalDefaultLimit measures the effect of the DefaultMaxResults
+// safety valve on high-hop traversals. On tuning, results are capped at 10,000;
+// on main, traversal is unbounded.
+func BenchmarkTraversalDefaultLimit(b *testing.B) {
+	g := openBenchGraph(b)
+	buildDenseGraph(b, g, 500, 5)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for range b.N {
+		res, err := g.Match("Node").
+			Where("name", "=", "n0").
+			Related("LINK", 1, 10).
+			Run(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if res.Len() == 0 {
+			b.Fatal("expected results")
+		}
 	}
 }
