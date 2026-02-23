@@ -2,7 +2,10 @@ module github.com/justintout/go-sqlite-graph
 
 go 1.23.0
 
-require zombiezen.com/go/sqlite v1.4.2
+require (
+	github.com/go-echarts/go-echarts/v2 v2.7.0
+	zombiezen.com/go/sqlite v1.4.2
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
