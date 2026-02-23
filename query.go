@@ -20,6 +20,11 @@ const (
 // MaxHops is the maximum allowed hop depth for traversal queries.
 const MaxHops = 10
 
+// DefaultMaxResults is the safety-valve limit applied to traversal queries
+// when no explicit Limit() is set. This prevents unbounded memory growth on
+// deep or dense graph walks.
+const DefaultMaxResults = 10_000
+
 // validOps is the whitelist of allowed SQL operators.
 var validOps = map[string]bool{
 	"=": true, "!=": true, "<>": true,

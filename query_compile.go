@@ -171,6 +171,8 @@ func (q *Query) compileSingleHopJoins(c *compiledQuery) (*compiledQuery, error) 
 
 	if q.limitVal > 0 {
 		sb.WriteString(fmt.Sprintf(" LIMIT %d", q.limitVal))
+	} else {
+		sb.WriteString(fmt.Sprintf(" LIMIT %d", DefaultMaxResults))
 	}
 	if q.offsetVal > 0 {
 		sb.WriteString(fmt.Sprintf(" OFFSET %d", q.offsetVal))
@@ -224,6 +226,8 @@ func (q *Query) compileWithCTEs(c *compiledQuery) (*compiledQuery, error) {
 
 	if q.limitVal > 0 {
 		sb.WriteString(fmt.Sprintf(" LIMIT %d", q.limitVal))
+	} else {
+		sb.WriteString(fmt.Sprintf(" LIMIT %d", DefaultMaxResults))
 	}
 	if q.offsetVal > 0 {
 		sb.WriteString(fmt.Sprintf(" OFFSET %d", q.offsetVal))

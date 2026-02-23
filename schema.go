@@ -37,8 +37,12 @@ CREATE INDEX idx_edges_source_type ON edges(source_id, type);
 CREATE INDEX idx_edges_target_type ON edges(target_id, type);
 `
 
+const migration2 = `
+CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+`
+
 func graphSchema() sqlitemigration.Schema {
 	return sqlitemigration.Schema{
-		Migrations: []string{migration1},
+		Migrations: []string{migration1, migration2},
 	}
 }

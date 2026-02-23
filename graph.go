@@ -26,7 +26,22 @@ type Graph struct {
 }
 
 func prepareConn(conn *sqlite.Conn) error {
-	return sqlitex.ExecuteTransient(conn, "PRAGMA foreign_keys = ON;", nil)
+	// PRAGMAs must be executed outside transactions (synchronous, journal_mode),
+	// so we use individual ExecuteTransient calls rather than ExecuteScript.
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL;",
+		"PRAGMA synchronous=NORMAL;",
+		"PRAGMA busy_timeout=5000;",
+		"PRAGMA cache_size=-64000;",
+		"PRAGMA mmap_size=268435456;",
+		"PRAGMA foreign_keys=ON;",
+	}
+	for _, p := range pragmas {
+		if err := sqlitex.ExecuteTransient(conn, p, nil); err != nil {
+			return fmt.Errorf("graph: %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // Open opens (or creates) a graph database at the given path.
@@ -56,6 +71,19 @@ func Open(uri string, opts *Options) (*Graph, error) {
 			},
 		})
 		g.migPool = pool
+
+		// Run ANALYZE after migration to populate sqlite_stat1 for the query planner.
+		conn, err := pool.Get(context.Background())
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("graph: post-migration analyze: %w", err)
+		}
+		err = maybeAnalyze(conn)
+		pool.Put(conn)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("graph: post-migration analyze: %w", err)
+		}
 	} else {
 		pool, err := sqlitex.NewPool(uri, sqlitex.PoolOptions{
 			PoolSize: poolSize,
@@ -107,6 +135,26 @@ func (g *Graph) conn(ctx context.Context) (*sqlite.Conn, error) {
 		return nil, fmt.Errorf("graph: could not get connection from pool: %w", err)
 	}
 	return conn, nil
+}
+
+// maybeAnalyze runs ANALYZE if sqlite_stat1 is empty or missing,
+// populating statistics for the query planner.
+func maybeAnalyze(conn *sqlite.Conn) error {
+	var hasStats bool
+	err := sqlitex.Execute(conn, "SELECT 1 FROM sqlite_stat1 LIMIT 1", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *sqlite.Stmt) error {
+			hasStats = true
+			return nil
+		},
+	})
+	if err != nil {
+		// sqlite_stat1 doesn't exist yet — ANALYZE will create it.
+		hasStats = false
+	}
+	if !hasStats {
+		return sqlitex.ExecuteTransient(conn, "ANALYZE", nil)
+	}
+	return nil
 }
 
 func (g *Graph) put(conn *sqlite.Conn) {
