@@ -1,5 +1,7 @@
 # go-sqlite-graph
 
+[![test](https://github.com/justintout/go-sqlite-graph/actions/workflows/test.yml/badge.svg)](https://github.com/justintout/go-sqlite-graph/actions/workflows/test.yml)
+
 Pure Go labeled property graph database backed by SQLite. No CGo required.
 
 Store nodes and edges with typed columns and arbitrary JSON properties, then traverse relationships using a fluent Go query builder that compiles to recursive CTEs for multi-hop path queries.
