@@ -339,3 +339,93 @@ func BenchmarkMatchSimple(b *testing.B) {
 		})
 	}
 }
+
+// buildRandomGraphTx creates n "Node" nodes, each with `degree` random outgoing
+// LINK edges, inside a single transaction. Returns node IDs.
+func buildRandomGraphTx(b *testing.B, g *Graph, n, degree int) []int64 {
+	b.Helper()
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(42))
+
+	tx, err := g.BeginTx(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	ids := make([]int64, n)
+	for i := range n {
+		node := &Node{Name: fmt.Sprintf("n%d", i), Labels: []string{"Node"}, Properties: map[string]any{"idx": i}}
+		if err := tx.CreateNode(ctx, node); err != nil {
+			b.Fatal(err)
+		}
+		ids[i] = node.ID
+	}
+	for i := range n {
+		for range degree {
+			if err := tx.CreateEdge(ctx, &Edge{SourceID: ids[i], TargetID: ids[rng.Intn(n)], Type: "LINK"}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	return ids
+}
+
+// BenchmarkTraversalLarge measures traversals on a 10k-node random graph with
+// 3 outgoing edges per node, where per-step cost should not grow with edge count.
+func BenchmarkTraversalLarge(b *testing.B) {
+	g := openBenchGraph(b)
+	buildRandomGraphTx(b, g, 10000, 3)
+	ctx := context.Background()
+
+	cases := []struct {
+		name     string
+		dir      Direction
+		min, max int
+	}{
+		{"out/hops=1", Outgoing, 1, 1},
+		{"out/hops=2", Outgoing, 1, 2},
+		{"out/hops=3", Outgoing, 1, 3},
+		{"out/hops=6", Outgoing, 1, 6},
+		{"out/hops=3-6", Outgoing, 3, 6},
+		{"both/hops=1", Both, 1, 1},
+		{"both/hops=3", Both, 1, 3},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			for range b.N {
+				res, err := g.Match("Node").
+					Where("name", "=", "n0").
+					RelatedDir("LINK", c.dir, c.min, c.max).
+					Run(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Len() == 0 {
+					b.Fatal("expected results")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkCreateNodeFile measures autocommit node creation against an on-disk database.
+func BenchmarkCreateNodeFile(b *testing.B) {
+	g, err := Open("file:"+b.TempDir()+"/bench.db", &Options{PoolSize: 2})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { g.Close() })
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := range b.N {
+		n := &Node{Name: fmt.Sprintf("n%d", i), Labels: []string{"Bench"}, Properties: map[string]any{"i": i}}
+		if err := g.CreateNode(ctx, n); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
