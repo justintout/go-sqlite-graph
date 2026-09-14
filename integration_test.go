@@ -362,6 +362,8 @@ func TestReturn(t *testing.T) {
 	}
 	for _, q := range []*Query{
 		g.Match("Person").Where("name", "=", "Alice").Return("labels"),
+		g.Match("Person").Where("name", "=", "Alice").WithLabels(),
+		g.Match("Person").Where("name", "=", "Alice").Return("name").WithLabels(),
 		g.Match("Company").RelatedDir("WORKS_AT", Incoming, 1, 1).WhereRel("name", "=", "Alice").Return("labels"),
 	} {
 		res, err := q.Run(ctx)
@@ -370,6 +372,9 @@ func TestReturn(t *testing.T) {
 		}
 		if got := res.Nodes()[0].Labels; !slices.Equal(got, []string{"Engineer", "Person"}) {
 			t.Errorf("labels = %v, want [Engineer Person]", got)
+		}
+		if q.withLabels && res.Nodes()[0].Name != "Alice" {
+			t.Errorf("WithLabels dropped name: %+v", res.Nodes()[0])
 		}
 	}
 

@@ -98,6 +98,12 @@ g.DeleteEdge(ctx, edge.ID)
 
 Edges are directed. `UpdateEdge` does not change the endpoints.
 
+`EdgesBetween` returns the edges whose endpoints are both in a set of node IDs, such as the nodes of a query result. Pass edge types to return only those.
+
+```go
+edges, err := g.EdgesBetween(ctx, []int64{alice.ID, bob.ID}, "KNOWS")
+```
+
 Get, update, and delete return an error when the ID does not exist.
 
 ### Transactions
@@ -182,7 +188,7 @@ The operators are `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`, `NOT LIKE`, `IN
 
 A step takes between 1 and `graph.MaxHops` (10) hops. A start node is in the result only if the step reaches it, for example through a cycle. Cycles do not loop forever: a walk expands each node at most once per depth.
 
-By default, query results populate every `Node` field except `Labels`, because reading labels makes queries about 40% slower. Select them with `Return`. Query results do not return edges. `Return` sets `ID` plus the named fields: `name`, `labels`, `created_at`, `updated_at`, `properties`, or a property path. A property whose name matches one of those columns can only be filtered, not returned. It sets a property path as a key in `Properties` and leaves every other field zero. Returning fewer fields skips JSON decoding, which is a large share of the cost of big traversals.
+By default, query results populate every `Node` field except `Labels`, because reading labels makes queries about 40% slower. `WithLabels` adds them to the returned fields, and `Return` can name `labels`. Query results do not include edges; read them with `EdgesBetween`. `Return` sets `ID` plus the named fields: `name`, `labels`, `created_at`, `updated_at`, `properties`, or a property path. A property whose name matches one of those columns can only be filtered, not returned. It sets a property path as a key in `Properties` and leaves every other field zero. Returning fewer fields skips JSON decoding, which is a large share of the cost of big traversals.
 
 `Count` ignores `Limit` and `Offset`.
 

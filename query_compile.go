@@ -34,7 +34,7 @@ func (b *sqlBuilder) w(parts ...string) {
 
 // allCols is the default projection. It omits labels: reading them runs a
 // subquery and decodes a JSON array per node, which made traversals ~40%
-// slower. Return("labels") selects them.
+// slower. Return("labels") and WithLabels select them.
 var allCols = []string{"name", "created_at", "updated_at", "properties"}
 
 var knownNodeCols = map[string]bool{"name": true, "labels": true, "created_at": true, "updated_at": true, "properties": true}
@@ -115,6 +115,10 @@ func (c *compiledQuery) writeSelect(b *sqlBuilder, q *Query, count bool) {
 			}
 			c.cols = append(c.cols, col)
 		}
+	}
+	if q.withLabels && !slices.Contains(c.cols, "labels") {
+		// Clip so the append copies instead of writing into allCols.
+		c.cols = append(slices.Clip(c.cols), "labels")
 	}
 
 	b.w("SELECT n.id")

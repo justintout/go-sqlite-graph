@@ -92,6 +92,7 @@ type Query struct {
 	wheres     []whereClause
 	rels       []relStep
 	returnCols []string
+	withLabels bool
 	limitVal   int
 	offsetVal  int
 	err        error // captures builder errors
@@ -220,6 +221,13 @@ func (q *Query) Return(cols ...string) *Query {
 		}
 	}
 	q.returnCols = cols
+	return q
+}
+
+// WithLabels adds Node.Labels to the fields the query returns, whether those
+// are the defaults or the columns named by Return.
+func (q *Query) WithLabels() *Query {
+	q.withLabels = true
 	return q
 }
 

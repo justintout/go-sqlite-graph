@@ -112,6 +112,11 @@ func (tx *Tx) DeleteEdge(ctx context.Context, id int64) error {
 	return deleteEdgeInternal(tx.conn, id)
 }
 
+// EdgesBetween returns the edges between nodeIDs within this transaction.
+func (tx *Tx) EdgesBetween(ctx context.Context, nodeIDs []int64, types ...string) ([]*Edge, error) {
+	return edgesBetweenInternal(tx.conn, nodeIDs, types)
+}
+
 // Match starts a query within this transaction.
 func (tx *Tx) Match(label string) *Query {
 	return &Query{
