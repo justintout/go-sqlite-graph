@@ -145,6 +145,14 @@ g.Match("Person").
     RelatedDir("KNOWS", graph.Incoming, 1, 1). // who knows Bob?
     Run(ctx)
 
+// Expand each reached node once. Faster on dense graphs with cycles,
+// slower on chains and sparse graphs; see Query.BreadthFirst.
+g.Match("Person").
+    Where("name", "=", "Alice").
+    Related("KNOWS", 1, 6).
+    BreadthFirst().
+    Run(ctx)
+
 // Project columns and property paths; unreturned fields stay zero.
 g.Match("Person").
     Related("KNOWS", 1, 3).

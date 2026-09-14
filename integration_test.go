@@ -222,19 +222,22 @@ func TestWhereRelIntermediateStep(t *testing.T) {
 	ctx := context.Background()
 	buildSocialGraph(t, g)
 
-	// Alice knows Bob and Charlie within 2 hops; only Charlie passes the
-	// filter, and Charlie works nowhere.
-	res, err := g.Match("Person").
-		Where("name", "=", "Alice").
-		Related("KNOWS", 1, 2).
-		WhereRel("name", "=", "Charlie").
-		Related("WORKS_AT", 1, 1).
-		Run(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Len() != 0 {
-		t.Errorf("got %v, want none", nodeNames(res.Nodes()))
+	// Alice knows Bob and Charlie within 2 hops. Filtering to Bob reaches
+	// Globex; filtering to Charlie, who works nowhere, reaches nothing.
+	for _, bfs := range []bool{false, true} {
+		for filter, want := range map[string]int{"Bob": 1, "Charlie": 0} {
+			q := g.Match("Person").Where("name", "=", "Alice").Related("KNOWS", 1, 2)
+			if bfs {
+				q = q.BreadthFirst()
+			}
+			res, err := q.WhereRel("name", "=", filter).Related("WORKS_AT", 1, 1).Run(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Len() != want {
+				t.Errorf("breadthFirst=%v filter=%s: got %v, want %d results", bfs, filter, nodeNames(res.Nodes()), want)
+			}
+		}
 	}
 }
 
@@ -534,25 +537,39 @@ func TestTraversalMatchesReference(t *testing.T) {
 		for _, minHops := range []int{1, 2} {
 			for maxHops := minHops; maxHops <= 6; maxHops++ {
 				for _, start := range []int{0, 17, 42} {
-					res, err := g.Match("V").
-						Where("name", "=", fmt.Sprintf("v%d", start)).
-						RelatedDir("E", dir, minHops, maxHops).
-						Return("name").
-						Run(ctx)
-					if err != nil {
-						t.Fatal(err)
-					}
-					want := reference(start, dir, minHops, maxHops)
-					got := map[string]bool{}
-					for _, node := range res.Nodes() {
-						got[node.Name] = true
-					}
-					if res.Len() != len(got) || !maps.Equal(got, want) {
-						t.Errorf("dir=%d hops=%d..%d start=v%d: got %d nodes (%d rows), want %d",
-							dir, minHops, maxHops, start, len(got), res.Len(), len(want))
+					for _, bfs := range []bool{false, true} {
+						if bfs && minHops != 1 {
+							continue
+						}
+						q := g.Match("V").
+							Where("name", "=", fmt.Sprintf("v%d", start)).
+							RelatedDir("E", dir, minHops, maxHops)
+						if bfs {
+							q = q.BreadthFirst()
+						}
+						res, err := q.Return("name").Run(ctx)
+						if err != nil {
+							t.Fatal(err)
+						}
+						want := reference(start, dir, minHops, maxHops)
+						got := map[string]bool{}
+						for _, node := range res.Nodes() {
+							got[node.Name] = true
+						}
+						if res.Len() != len(got) || !maps.Equal(got, want) {
+							t.Errorf("dir=%d hops=%d..%d start=v%d breadthFirst=%v: got %d nodes (%d rows), want %d",
+								dir, minHops, maxHops, start, bfs, len(got), res.Len(), len(want))
+						}
 					}
 				}
 			}
 		}
+	}
+}
+
+func TestBreadthFirstRequiresMinHopsOne(t *testing.T) {
+	g := openTestGraph(t)
+	if _, err := g.Match("V").Related("E", 2, 4).BreadthFirst().Run(context.Background()); err == nil {
+		t.Error("BreadthFirst accepted minHops of 2")
 	}
 }
