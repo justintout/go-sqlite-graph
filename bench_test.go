@@ -475,3 +475,55 @@ func BenchmarkReturn(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkBreadthFirst compares the default walk with BreadthFirst on graph
+// shapes where each wins: chains and trees never revisit nodes, while dense
+// graphs with cycles revisit them at many depths.
+func BenchmarkBreadthFirst(b *testing.B) {
+	ctx := context.Background()
+	chain := openBenchGraph(b)
+	buildChainGraph(b, chain, 100)
+	tree := openBenchGraph(b)
+	buildFanoutGraph(b, tree, 6, 3)
+	dense := openBenchGraph(b)
+	buildDenseGraph(b, dense, 500, 5)
+	large := openBenchGraph(b)
+	buildRandomGraphTx(b, large, 10000, 3, func(i int) map[string]any { return nil })
+
+	cases := []struct {
+		name  string
+		query func() *Query
+	}{
+		{"chain/hops=10", func() *Query { return chain.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 10) }},
+		{"tree/depth=6", func() *Query { return tree.Match("Root").Related("CHILD", 1, 6) }},
+		{"dense/hops=5", func() *Query { return dense.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 5) }},
+		{"dense/hops=10", func() *Query { return dense.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 10) }},
+		{"large/out/hops=6", func() *Query { return large.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 6) }},
+		{"large/both/hops=4", func() *Query {
+			return large.Match("Node").Where("name", "=", "n0").RelatedDir("LINK", Both, 1, 4)
+		}},
+	}
+	for _, c := range cases {
+		for _, bfs := range []bool{false, true} {
+			name := c.name + "/default"
+			if bfs {
+				name = c.name + "/breadth-first"
+			}
+			b.Run(name, func(b *testing.B) {
+				for range b.N {
+					q := c.query()
+					if bfs {
+						q = q.BreadthFirst()
+					}
+					res, err := q.Run(ctx)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if res.Len() == 0 {
+						b.Fatal("expected results")
+					}
+				}
+			})
+		}
+	}
+}

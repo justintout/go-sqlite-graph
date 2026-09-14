@@ -155,6 +155,8 @@ func writeStep(b *sqlBuilder, i int, r relStep) {
 		b.w(", ", reached, "(node_id) AS (")
 		writeHops(b, prev, r, hopAll, "")
 		b.w(")")
+	case r.breadthFirst:
+		writeBFS(b, step, prev, reached, r)
 	default:
 		// UNION deduplicates on (node_id, depth), which bounds the work per
 		// depth level by the node count and stops cycles.
@@ -171,6 +173,47 @@ func writeStep(b *sqlBuilder, i int, r relStep) {
 	}
 }
 
+// writeBFS appends CTEs reaching nodes within 1..maxHops of prev, expanding
+// each node once. The recursive CTE deduplicates on (node, depth), so on
+// graphs with cycles it re-expands a node at every depth it is reachable.
+// Here frontier f<k> holds nodes first reached at depth k: the expansion of
+// f<k-1> minus all earlier frontiers. A start node is not excluded, so it is
+// reached again through a cycle, matching the recursive form.
+//
+// Each level costs a fixed ~20µs to build its temporary tables, so this only
+// wins when the walk revisits many nodes; see Query.BreadthFirst.
+func writeBFS(b *sqlBuilder, step, prev, reached string, r relStep) {
+	front := func(k int) string { return "f" + step + "_" + strconv.Itoa(k) }
+	for k := 1; k <= r.maxHops; k++ {
+		from := prev
+		exclude := ""
+		if k > 1 {
+			from = front(k - 1)
+			var ex strings.Builder
+			for j := 1; j < k; j++ {
+				if j > 1 {
+					ex.WriteString(" UNION ALL ")
+				}
+				ex.WriteString("SELECT node_id FROM " + front(j))
+			}
+			exclude = ex.String()
+		}
+		// MATERIALIZED keeps each frontier from being re-evaluated by every
+		// later level that excludes it.
+		b.w(", ", front(k), "(node_id) AS MATERIALIZED (")
+		writeHops(b, from, r, hopNew, exclude)
+		b.w(")")
+	}
+	b.w(", ", reached, "(node_id) AS (")
+	for k := 1; k <= r.maxHops; k++ {
+		if k > 1 {
+			b.w(" UNION ALL ")
+		}
+		b.w("SELECT node_id FROM ", front(k))
+	}
+	b.w(")")
+}
+
 // hopMode selects how writeHops shapes its SELECT.
 type hopMode int
 
@@ -180,10 +223,13 @@ const (
 	// hopRecursive is the recursive member of a walk CTE: it carries
 	// depth + 1 and filters on the depth condition.
 	hopRecursive
+	// hopNew selects distinct reached nodes not in the exclusion subquery.
+	hopNew
 )
 
 // writeHops appends a SELECT of the nodes one hop from table from along r.
-// cond is the depth condition for hopRecursive.
+// cond is the depth condition for hopRecursive, or the exclusion subquery for
+// hopNew (empty to exclude nothing).
 // Both directions compile to two SELECTs, one per endpoint column, so each can
 // use its covering index; an OR in the join condition defeats index use.
 func writeHops(b *sqlBuilder, from string, r relStep, mode hopMode, cond string) {
@@ -206,13 +252,20 @@ func writeHops(b *sqlBuilder, from string, r relStep, mode hopMode, cond string)
 				b.w(" UNION ")
 			}
 		}
-		b.w("SELECT e.", s.far)
+		b.w("SELECT ")
+		if mode == hopNew && len(sides) == 1 {
+			b.w("DISTINCT ")
+		}
+		b.w("e.", s.far)
 		if mode == hopRecursive {
 			b.w(", p.depth + 1")
 		}
 		b.w(" FROM ", from, " p CROSS JOIN edges e ON e.", s.near, " = p.node_id AND e.type = ?")
-		if mode == hopRecursive {
+		switch {
+		case mode == hopRecursive:
 			b.w(" WHERE ", cond)
+		case mode == hopNew && cond != "":
+			b.w(" WHERE e.", s.far, " NOT IN (", cond, ")")
 		}
 		b.args = append(b.args, r.edgeType)
 	}
