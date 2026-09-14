@@ -2,6 +2,9 @@ package graph
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"math/rand"
 	"testing"
 )
 
@@ -469,4 +472,87 @@ func containsAny(haystack []string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+// TestTraversalMatchesReference checks every traversal compilation path
+// against walks computed in Go on a random graph with cycles and self-loops.
+func TestTraversalMatchesReference(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(7))
+
+	const n = 60
+	ids := make([]int64, n)
+	index := map[int64]int{}
+	for i := range n {
+		node := &Node{Name: fmt.Sprintf("v%d", i), Labels: []string{"V"}}
+		if err := g.CreateNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = node.ID
+		index[node.ID] = i
+	}
+	out := make([][]int, n)
+	in := make([][]int, n)
+	for range 2 * n {
+		s, d := rng.Intn(n), rng.Intn(n)
+		if err := g.CreateEdge(ctx, &Edge{SourceID: ids[s], TargetID: ids[d], Type: "E"}); err != nil {
+			t.Fatal(err)
+		}
+		out[s] = append(out[s], d)
+		in[d] = append(in[d], s)
+	}
+
+	reference := func(start int, dir Direction, minHops, maxHops int) map[string]bool {
+		frontier := map[int]bool{start: true}
+		reached := map[string]bool{}
+		for depth := 1; depth <= maxHops; depth++ {
+			next := map[int]bool{}
+			for v := range frontier {
+				if dir != Incoming {
+					for _, u := range out[v] {
+						next[u] = true
+					}
+				}
+				if dir != Outgoing {
+					for _, u := range in[v] {
+						next[u] = true
+					}
+				}
+			}
+			if depth >= minHops {
+				for v := range next {
+					reached[fmt.Sprintf("v%d", v)] = true
+				}
+			}
+			frontier = next
+		}
+		return reached
+	}
+
+	for _, dir := range []Direction{Outgoing, Incoming, Both} {
+		for _, minHops := range []int{1, 2} {
+			for maxHops := minHops; maxHops <= 6; maxHops++ {
+				for _, start := range []int{0, 17, 42} {
+					res, err := g.Match("V").
+						Where("name", "=", fmt.Sprintf("v%d", start)).
+						RelatedDir("E", dir, minHops, maxHops).
+						Return("name").
+						Run(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := reference(start, dir, minHops, maxHops)
+					got := map[string]bool{}
+					for _, node := range res.Nodes() {
+						got[node.Name] = true
+					}
+					if res.Len() != len(got) || !maps.Equal(got, want) {
+						t.Errorf("dir=%d hops=%d..%d start=v%d: got %d nodes (%d rows), want %d",
+							dir, minHops, maxHops, start, len(got), res.Len(), len(want))
+					}
+				}
+			}
+		}
+	}
 }

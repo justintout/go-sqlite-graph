@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"zombiezen.com/go/sqlite"
@@ -15,6 +16,20 @@ type compiledQuery struct {
 	args []any
 	// cols lists the selected columns after n.id, as Return names.
 	cols []string
+}
+
+// sqlBuilder accumulates SQL text and its bound arguments. It writes plain
+// strings rather than using fmt, which allocated for every formatted value and
+// made compiling a large share of a small query's cost.
+type sqlBuilder struct {
+	strings.Builder
+	args []any
+}
+
+func (b *sqlBuilder) w(parts ...string) {
+	for _, p := range parts {
+		b.WriteString(p)
+	}
 }
 
 var allCols = []string{"name", "created_at", "updated_at", "properties"}
@@ -41,44 +56,46 @@ var knownNodeCols = map[string]bool{"name": true, "created_at": true, "updated_a
 // a bound LIMIT makes SQLite re-prepare the statement on every execution.
 func (q *Query) compile(count bool) *compiledQuery {
 	c := &compiledQuery{}
-	var sb strings.Builder
+	b := &sqlBuilder{args: make([]any, 0, 8)}
+	b.Grow(512)
 
 	if len(q.rels) == 0 {
-		c.writeSelect(&sb, q, count)
-		c.writeStartFrom(&sb, q)
+		c.writeSelect(b, q, count)
+		writeStartFrom(b, q)
 	} else {
-		sb.WriteString("WITH RECURSIVE s0(node_id) AS (SELECT n.id")
-		c.writeStartFrom(&sb, q)
-		sb.WriteString(")")
+		b.w("WITH RECURSIVE s0(node_id) AS (SELECT n.id")
+		writeStartFrom(b, q)
+		b.w(")")
 
 		for i, r := range q.rels {
-			c.writeStep(&sb, i+1, r)
+			writeStep(b, i+1, r)
 		}
 
-		sb.WriteString(" ")
-		c.writeSelect(&sb, q, count)
-		fmt.Fprintf(&sb, " FROM (SELECT DISTINCT node_id FROM s%d) s CROSS JOIN nodes n ON n.id = s.node_id", len(q.rels))
+		b.w(" ")
+		c.writeSelect(b, q, count)
+		b.w(" FROM (SELECT DISTINCT node_id FROM s", strconv.Itoa(len(q.rels)), ") s CROSS JOIN nodes n ON n.id = s.node_id")
 	}
 
 	if !count && (q.limitVal > 0 || q.offsetVal > 0) {
-		sb.WriteString(" LIMIT ? OFFSET ?")
+		b.w(" LIMIT ? OFFSET ?")
 		limit := q.limitVal
 		if limit <= 0 {
 			limit = -1
 		}
-		c.args = append(c.args, limit, max(q.offsetVal, 0))
+		b.args = append(b.args, limit, max(q.offsetVal, 0))
 	}
 
-	c.sql = sb.String()
+	c.sql = b.String()
+	c.args = b.args
 	return c
 }
 
 // writeSelect appends the SELECT list: COUNT(*), or n.id followed by the
 // columns named by Return. Property paths extract only their JSON value, so
 // rows skip decoding the whole properties document.
-func (c *compiledQuery) writeSelect(sb *strings.Builder, q *Query, count bool) {
+func (c *compiledQuery) writeSelect(b *sqlBuilder, q *Query, count bool) {
 	if count {
-		sb.WriteString("SELECT COUNT(*)")
+		b.w("SELECT COUNT(*)")
 		return
 	}
 	c.cols = allCols
@@ -94,19 +111,19 @@ func (c *compiledQuery) writeSelect(sb *strings.Builder, q *Query, count bool) {
 		}
 	}
 
-	sb.WriteString("SELECT n.id")
+	b.w("SELECT n.id")
 	for _, col := range c.cols {
 		if knownNodeCols[col] {
-			sb.WriteString(", n." + col)
+			b.w(", n.", col)
 			continue
 		}
-		sb.WriteString(", n.properties -> ?")
-		c.args = append(c.args, "$."+col)
+		b.w(", n.properties -> ?")
+		b.args = append(b.args, "$."+col)
 	}
 }
 
 // writeStartFrom appends the FROM and WHERE clauses selecting the start nodes n.
-func (c *compiledQuery) writeStartFrom(sb *strings.Builder, q *Query) {
+func writeStartFrom(b *sqlBuilder, q *Query) {
 	// Without ANALYZE statistics the planner rates the label and name indexes
 	// equally and drives from the label, scanning every node carrying it. A
 	// name equality is almost always more selective, so the unary + removes
@@ -119,45 +136,57 @@ func (c *compiledQuery) writeStartFrom(sb *strings.Builder, q *Query) {
 			break
 		}
 	}
-	fmt.Fprintf(sb, " FROM nodes n JOIN node_labels nl ON nl.node_id = n.id WHERE %s = ?", label)
-	c.args = append(c.args, q.matchLabel)
-	c.writeWheres(sb, "n", q.wheres)
+	b.w(" FROM nodes n JOIN node_labels nl ON nl.node_id = n.id WHERE ", label, " = ?")
+	b.args = append(b.args, q.matchLabel)
+	writeWheres(b, "n", q.wheres)
 }
 
 // writeStep appends CTE s<i>(node_id): the nodes reached from s<i-1> by r.
-func (c *compiledQuery) writeStep(sb *strings.Builder, i int, r relStep) {
-	prev := fmt.Sprintf("s%d", i-1)
-	reached := fmt.Sprintf("s%d", i)
+func writeStep(b *sqlBuilder, i int, r relStep) {
+	step := strconv.Itoa(i)
+	prev := "s" + strconv.Itoa(i-1)
+	reached := "s" + step
 	if len(r.wheres) > 0 {
-		reached = fmt.Sprintf("u%d", i)
+		reached = "u" + step
 	}
 
-	if r.maxHops == 1 {
-		fmt.Fprintf(sb, ", %s(node_id) AS (", reached)
-		c.writeHops(sb, prev, "", r)
-		sb.WriteString(")")
-	} else {
+	switch {
+	case r.maxHops == 1:
+		b.w(", ", reached, "(node_id) AS (")
+		writeHops(b, prev, r, hopAll, "")
+		b.w(")")
+	default:
 		// UNION deduplicates on (node_id, depth), which bounds the work per
 		// depth level by the node count and stops cycles.
-		walk := fmt.Sprintf("w%d", i)
-		fmt.Fprintf(sb, ", %s(node_id, depth) AS (SELECT node_id, 0 FROM %s UNION ", walk, prev)
-		c.writeHops(sb, walk, fmt.Sprintf("p.depth < %d", r.maxHops), r)
-		fmt.Fprintf(sb, "), %s(node_id) AS (SELECT node_id FROM %s WHERE depth >= %d)", reached, walk, r.minHops)
+		walk := "w" + step
+		b.w(", ", walk, "(node_id, depth) AS (SELECT node_id, 0 FROM ", prev, " UNION ")
+		writeHops(b, walk, r, hopRecursive, "p.depth < "+strconv.Itoa(r.maxHops))
+		b.w("), ", reached, "(node_id) AS (SELECT node_id FROM ", walk, " WHERE depth >= ", strconv.Itoa(r.minHops), ")")
 	}
 
 	if len(r.wheres) > 0 {
-		fmt.Fprintf(sb, ", s%d(node_id) AS (SELECT n.id FROM (SELECT DISTINCT node_id FROM %s) x CROSS JOIN nodes n ON n.id = x.node_id", i, reached)
-		c.writeWheres(sb, "n", r.wheres)
-		sb.WriteString(")")
+		b.w(", s", step, "(node_id) AS (SELECT n.id FROM (SELECT DISTINCT node_id FROM ", reached, ") x CROSS JOIN nodes n ON n.id = x.node_id")
+		writeWheres(b, "n", r.wheres)
+		b.w(")")
 	}
 }
 
-// writeHops appends a SELECT of one hop from table from along r. For a
-// recursive CTE, the SELECT also carries depth + 1 and the cond filter.
-// Both directions compile to two SELECTs joined by UNION ALL (UNION inside a
-// recursive CTE) so each side can use its covering index; an OR in the join
-// condition defeats index use.
-func (c *compiledQuery) writeHops(sb *strings.Builder, from, cond string, r relStep) {
+// hopMode selects how writeHops shapes its SELECT.
+type hopMode int
+
+const (
+	// hopAll selects every reached node, duplicates included.
+	hopAll hopMode = iota
+	// hopRecursive is the recursive member of a walk CTE: it carries
+	// depth + 1 and filters on the depth condition.
+	hopRecursive
+)
+
+// writeHops appends a SELECT of the nodes one hop from table from along r.
+// cond is the depth condition for hopRecursive.
+// Both directions compile to two SELECTs, one per endpoint column, so each can
+// use its covering index; an OR in the join condition defeats index use.
+func writeHops(b *sqlBuilder, from string, r relStep, mode hopMode, cond string) {
 	type side struct{ near, far string }
 	var sides []side
 	switch r.direction {
@@ -169,39 +198,38 @@ func (c *compiledQuery) writeHops(sb *strings.Builder, from, cond string, r relS
 		sides = []side{{"source_id", "target_id"}, {"target_id", "source_id"}}
 	}
 
-	recursive := cond != ""
 	for j, s := range sides {
 		if j > 0 {
-			if recursive {
-				sb.WriteString(" UNION ")
+			if mode == hopAll {
+				b.w(" UNION ALL ")
 			} else {
-				sb.WriteString(" UNION ALL ")
+				b.w(" UNION ")
 			}
 		}
-		fmt.Fprintf(sb, "SELECT e.%s", s.far)
-		if recursive {
-			sb.WriteString(", p.depth + 1")
+		b.w("SELECT e.", s.far)
+		if mode == hopRecursive {
+			b.w(", p.depth + 1")
 		}
-		fmt.Fprintf(sb, " FROM %s p CROSS JOIN edges e ON e.%s = p.node_id AND e.type = ?", from, s.near)
-		if recursive {
-			sb.WriteString(" WHERE " + cond)
+		b.w(" FROM ", from, " p CROSS JOIN edges e ON e.", s.near, " = p.node_id AND e.type = ?")
+		if mode == hopRecursive {
+			b.w(" WHERE ", cond)
 		}
-		c.args = append(c.args, r.edgeType)
+		b.args = append(b.args, r.edgeType)
 	}
 }
 
-func (c *compiledQuery) writeWheres(sb *strings.Builder, tableAlias string, wheres []whereClause) {
+func writeWheres(b *sqlBuilder, tableAlias string, wheres []whereClause) {
 	for _, w := range wheres {
-		sb.WriteString(" AND ")
+		b.w(" AND ")
 		if w.isJSON {
 			// The path is bound, never interpolated, so any key is safe.
-			fmt.Fprintf(sb, "%s %s ?", jsonExtractExpr(tableAlias, w.value), w.op)
-			c.args = append(c.args, "$."+w.field, w.value)
+			b.w(jsonExtractExpr(tableAlias, w.value), " ", w.op, " ?")
+			b.args = append(b.args, "$."+w.field, w.value)
 			continue
 		}
 		// w.field is checked against filterCols and w.op against validOps.
-		fmt.Fprintf(sb, "%s.%s %s ?", tableAlias, w.field, w.op)
-		c.args = append(c.args, w.value)
+		b.w(tableAlias, ".", w.field, " ", w.op, " ?")
+		b.args = append(b.args, w.value)
 	}
 }
 

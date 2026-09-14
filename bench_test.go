@@ -390,10 +390,12 @@ func BenchmarkTraversalLarge(b *testing.B) {
 		{"out/hops=1", Outgoing, 1, 1},
 		{"out/hops=2", Outgoing, 1, 2},
 		{"out/hops=3", Outgoing, 1, 3},
+		{"out/hops=4", Outgoing, 1, 4},
 		{"out/hops=6", Outgoing, 1, 6},
 		{"out/hops=3-6", Outgoing, 3, 6},
 		{"both/hops=1", Both, 1, 1},
 		{"both/hops=3", Both, 1, 3},
+		{"both/hops=4", Both, 1, 4},
 	}
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
