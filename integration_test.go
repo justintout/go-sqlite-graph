@@ -260,6 +260,73 @@ func TestBothDirection(t *testing.T) {
 	}
 }
 
+func TestFilterInjection(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	buildSocialGraph(t, g)
+
+	evil := "name = name OR 1=1; DROP TABLE nodes; --"
+	if _, err := g.Match("Person").Where(evil, "=", "x").Run(ctx); err == nil {
+		t.Error("Where accepted an arbitrary column name")
+	}
+	if _, err := g.Match("Person").Related("KNOWS", 1, 1).WhereRel(evil, "=", "x").Run(ctx); err == nil {
+		t.Error("WhereRel accepted an arbitrary column name")
+	}
+
+	// A hostile path is bound as a JSON path: it matches nothing and leaves the data intact.
+	path := "age' IS NOT NULL OR 1=1 OR '"
+	for _, q := range []*Query{
+		g.Match("Person").WhereJSON(path, "=", 30),
+		g.Match("Person").Related("KNOWS", 1, 1).WhereRelJSON(path, "=", 30),
+		g.Match("Person").Return(path),
+	} {
+		res, err := q.Run(ctx)
+		if err == nil && q.returnCols == nil && res.Len() != 0 {
+			t.Errorf("hostile path matched %v", nodeNames(res.Nodes()))
+		}
+	}
+	if n, err := g.Match("Person").Count(ctx); err != nil || n != 5 {
+		t.Errorf("count = %d, %v; want 5", n, err)
+	}
+}
+
+func TestReturn(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	alice, _, _, _, _, _, _ := buildSocialGraph(t, g)
+
+	// Traversal from Alice via WORKS_AT reaches Acme, which has industry but no age.
+	for _, q := range []*Query{
+		g.Match("Person").Where("name", "=", "Alice").Return("name", "age", "missing"),
+		g.Match("Person").Where("name", "=", "Alice").Related("KNOWS", 1, 1).RelatedDir("KNOWS", Incoming, 1, 1).Return("id", "name", "age"),
+	} {
+		res, err := q.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Len() != 1 {
+			t.Fatalf("got %d results, want 1", res.Len())
+		}
+		n := res.Nodes()[0]
+		if n.ID != alice.ID || n.Name != "Alice" || n.CreatedAt != "" {
+			t.Errorf("got %+v, want ID %d, name Alice, no created_at", n, alice.ID)
+		}
+		if len(n.Properties) != 1 || n.Properties["age"] != float64(30) {
+			t.Errorf("properties = %v, want map[age:30]", n.Properties)
+		}
+	}
+
+	res, err := g.Match("Company").Return("properties", "industry").Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range res.Nodes() {
+		if n.Name != "" || n.Properties["industry"] == nil {
+			t.Errorf("got %+v, want only properties", n)
+		}
+	}
+}
+
 func TestCycleHandling(t *testing.T) {
 	g := openTestGraph(t)
 	ctx := context.Background()

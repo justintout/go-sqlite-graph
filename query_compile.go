@@ -1,7 +1,9 @@
 package graph
 
 import (
+	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"zombiezen.com/go/sqlite"
@@ -11,9 +13,13 @@ import (
 type compiledQuery struct {
 	sql  string
 	args []any
+	// cols lists the selected columns after n.id, as Return names.
+	cols []string
 }
 
-const nodeCols = "n.id, n.name, n.created_at, n.updated_at, n.properties"
+var allCols = []string{"name", "created_at", "updated_at", "properties"}
+
+var knownNodeCols = map[string]bool{"name": true, "created_at": true, "updated_at": true, "properties": true}
 
 // compile builds the SQL for q. With count set, it selects COUNT(*) and
 // ignores Limit and Offset.
@@ -38,11 +44,7 @@ func (q *Query) compile(count bool) *compiledQuery {
 	var sb strings.Builder
 
 	if len(q.rels) == 0 {
-		if count {
-			sb.WriteString("SELECT COUNT(*)")
-		} else {
-			sb.WriteString("SELECT " + nodeCols)
-		}
+		c.writeSelect(&sb, q, count)
 		c.writeStartFrom(&sb, q)
 	} else {
 		sb.WriteString("WITH RECURSIVE s0(node_id) AS (SELECT n.id")
@@ -53,11 +55,8 @@ func (q *Query) compile(count bool) *compiledQuery {
 			c.writeStep(&sb, i+1, r)
 		}
 
-		if count {
-			sb.WriteString(" SELECT COUNT(*)")
-		} else {
-			sb.WriteString(" SELECT " + nodeCols)
-		}
+		sb.WriteString(" ")
+		c.writeSelect(&sb, q, count)
 		fmt.Fprintf(&sb, " FROM (SELECT DISTINCT node_id FROM s%d) s CROSS JOIN nodes n ON n.id = s.node_id", len(q.rels))
 	}
 
@@ -72,6 +71,38 @@ func (q *Query) compile(count bool) *compiledQuery {
 
 	c.sql = sb.String()
 	return c
+}
+
+// writeSelect appends the SELECT list: COUNT(*), or n.id followed by the
+// columns named by Return. Property paths extract only their JSON value, so
+// rows skip decoding the whole properties document.
+func (c *compiledQuery) writeSelect(sb *strings.Builder, q *Query, count bool) {
+	if count {
+		sb.WriteString("SELECT COUNT(*)")
+		return
+	}
+	c.cols = allCols
+	if len(q.returnCols) > 0 {
+		c.cols = nil
+		all := slices.Contains(q.returnCols, "properties")
+		for _, col := range q.returnCols {
+			// Paths are redundant when the whole document is returned.
+			if col == "id" || (all && !knownNodeCols[col]) || slices.Contains(c.cols, col) {
+				continue
+			}
+			c.cols = append(c.cols, col)
+		}
+	}
+
+	sb.WriteString("SELECT n.id")
+	for _, col := range c.cols {
+		if knownNodeCols[col] {
+			sb.WriteString(", n." + col)
+			continue
+		}
+		sb.WriteString(", n.properties -> ?")
+		c.args = append(c.args, "$."+col)
+	}
 }
 
 // writeStartFrom appends the FROM and WHERE clauses selecting the start nodes n.
@@ -161,30 +192,28 @@ func (c *compiledQuery) writeHops(sb *strings.Builder, from, cond string, r relS
 
 func (c *compiledQuery) writeWheres(sb *strings.Builder, tableAlias string, wheres []whereClause) {
 	for _, w := range wheres {
-		clause, arg := buildWhereExpr(tableAlias, w)
 		sb.WriteString(" AND ")
-		sb.WriteString(clause)
-		c.args = append(c.args, arg)
+		if w.isJSON {
+			// The path is bound, never interpolated, so any key is safe.
+			fmt.Fprintf(sb, "%s %s ?", jsonExtractExpr(tableAlias, w.value), w.op)
+			c.args = append(c.args, "$."+w.field, w.value)
+			continue
+		}
+		// w.field is checked against filterCols and w.op against validOps.
+		fmt.Fprintf(sb, "%s.%s %s ?", tableAlias, w.field, w.op)
+		c.args = append(c.args, w.value)
 	}
 }
 
-// buildWhereExpr builds a single WHERE expression clause and returns it with the bound arg.
-func buildWhereExpr(tableAlias string, w whereClause) (string, any) {
-	if w.isJSON {
-		expr := jsonExtractExpr(tableAlias, w.field, w.value)
-		return fmt.Sprintf("%s %s ?", expr, w.op), w.value
-	}
-	return fmt.Sprintf("%s.%s %s ?", tableAlias, w.field, w.op), w.value
-}
-
-// jsonExtractExpr returns the SQLite expression to extract and optionally cast a JSON property.
-func jsonExtractExpr(tableAlias, path string, value any) string {
-	extract := fmt.Sprintf("%s.properties->>'$.%s'", tableAlias, path)
+// jsonExtractExpr returns the SQLite expression that extracts the property at
+// a bound path parameter, cast to match the Go type of value.
+func jsonExtractExpr(tableAlias string, value any) string {
+	extract := tableAlias + ".properties ->> ?"
 	switch value.(type) {
 	case int, int8, int16, int32, int64:
-		return fmt.Sprintf("CAST(%s AS INTEGER)", extract)
+		return "CAST(" + extract + " AS INTEGER)"
 	case float32, float64:
-		return fmt.Sprintf("CAST(%s AS REAL)", extract)
+		return "CAST(" + extract + " AS REAL)"
 	default:
 		return extract
 	}
@@ -196,16 +225,35 @@ func (c *compiledQuery) execute(conn *sqlite.Conn) (*Result, error) {
 	err := sqlitex.Execute(conn, c.sql, &sqlitex.ExecOptions{
 		Args: c.args,
 		ResultFunc: func(stmt *sqlite.Stmt) error {
-			n := &Node{
-				ID:        stmt.ColumnInt64(0),
-				Name:      stmt.ColumnText(1),
-				CreatedAt: stmt.ColumnText(2),
-				UpdatedAt: stmt.ColumnText(3),
-			}
-			var err error
-			n.Properties, err = UnmarshalProperties(stmt.ColumnText(4))
-			if err != nil {
-				return err
+			n := &Node{ID: stmt.ColumnInt64(0)}
+			for i, col := range c.cols {
+				i++
+				switch col {
+				case "name":
+					n.Name = stmt.ColumnText(i)
+				case "created_at":
+					n.CreatedAt = stmt.ColumnText(i)
+				case "updated_at":
+					n.UpdatedAt = stmt.ColumnText(i)
+				case "properties":
+					props, err := UnmarshalProperties(stmt.ColumnText(i))
+					if err != nil {
+						return err
+					}
+					n.Properties = props
+				default:
+					if n.Properties == nil {
+						n.Properties = map[string]any{}
+					}
+					if stmt.ColumnType(i) == sqlite.TypeNull {
+						continue
+					}
+					var v any
+					if err := json.Unmarshal([]byte(stmt.ColumnText(i)), &v); err != nil {
+						return fmt.Errorf("graph: decode property %q: %w", col, err)
+					}
+					n.Properties[col] = v
+				}
 			}
 			res.rows = append(res.rows, ResultRow{Node: n})
 			return nil

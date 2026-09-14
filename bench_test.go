@@ -341,8 +341,9 @@ func BenchmarkMatchSimple(b *testing.B) {
 }
 
 // buildRandomGraphTx creates n "Node" nodes, each with `degree` random outgoing
-// LINK edges, inside a single transaction. Returns node IDs.
-func buildRandomGraphTx(b *testing.B, g *Graph, n, degree int) []int64 {
+// LINK edges, inside a single transaction. Node i gets props(i) as properties.
+// Returns node IDs.
+func buildRandomGraphTx(b *testing.B, g *Graph, n, degree int, props func(i int) map[string]any) []int64 {
 	b.Helper()
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(42))
@@ -355,7 +356,7 @@ func buildRandomGraphTx(b *testing.B, g *Graph, n, degree int) []int64 {
 
 	ids := make([]int64, n)
 	for i := range n {
-		node := &Node{Name: fmt.Sprintf("n%d", i), Labels: []string{"Node"}, Properties: map[string]any{"idx": i}}
+		node := &Node{Name: fmt.Sprintf("n%d", i), Labels: []string{"Node"}, Properties: props(i)}
 		if err := tx.CreateNode(ctx, node); err != nil {
 			b.Fatal(err)
 		}
@@ -378,7 +379,7 @@ func buildRandomGraphTx(b *testing.B, g *Graph, n, degree int) []int64 {
 // 3 outgoing edges per node, where per-step cost should not grow with edge count.
 func BenchmarkTraversalLarge(b *testing.B) {
 	g := openBenchGraph(b)
-	buildRandomGraphTx(b, g, 10000, 3)
+	buildRandomGraphTx(b, g, 10000, 3, func(i int) map[string]any { return map[string]any{"idx": i} })
 	ctx := context.Background()
 
 	cases := []struct {
@@ -427,5 +428,48 @@ func BenchmarkCreateNodeFile(b *testing.B) {
 		if err := g.CreateNode(ctx, n); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkReturn measures projecting columns and property paths with Return
+// against returning whole nodes, on a 6-hop traversal reaching ~700 nodes that
+// each carry a 10-key property document.
+func BenchmarkReturn(b *testing.B) {
+	g := openBenchGraph(b)
+	buildRandomGraphTx(b, g, 10000, 3, func(i int) map[string]any {
+		return map[string]any{
+			"idx": i, "email": fmt.Sprintf("user%d@example.com", i), "active": i%2 == 0,
+			"score": float64(i) / 7, "city": "Springfield", "country": "US",
+			"tags": []string{"a", "b", "c"}, "bio": "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+			"address": map[string]any{"street": "742 Evergreen Terrace", "zip": "49007"}, "version": 3,
+		}
+	})
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		cols []string
+	}{
+		{"all", nil},
+		{"id", []string{"id"}},
+		{"name", []string{"name"}},
+		{"name+2props", []string{"name", "email", "score"}},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			for range b.N {
+				q := g.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 6)
+				if c.cols != nil {
+					q = q.Return(c.cols...)
+				}
+				res, err := q.Run(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Len() == 0 {
+					b.Fatal("expected results")
+				}
+			}
+		})
 	}
 }
