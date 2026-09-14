@@ -10,7 +10,6 @@ var (
 	BuildCategories = buildCategories
 	ConvertNodes    = convertNodes
 	ConvertEdges    = convertEdges
-	NodeNameIndex   = nodeNameIndex
 	NewPalette      = newPalette
 )
 

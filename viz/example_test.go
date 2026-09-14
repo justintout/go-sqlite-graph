@@ -42,5 +42,5 @@ func Example() {
 	fi, _ := f.Stat()
 	fmt.Printf("rendered %d bytes of HTML\n", fi.Size())
 	// Output:
-	// rendered 1616 bytes of HTML
+	// rendered 1625 bytes of HTML
 }

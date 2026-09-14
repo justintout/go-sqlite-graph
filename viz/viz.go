@@ -114,9 +114,11 @@ func (c *Chart) Render(w io.Writer) error {
 		}
 	}
 
-	g.AddSeries("graph", gNodes, gLinks,
+	g.AddSeries("graph", nil, gLinks,
 		charts.WithGraphChartOpts(graphOpts),
 	)
+	// AddSeries accepts only opts.GraphNode, which has no id field.
+	g.MultiSeries[0].Data = gNodes
 
 	return g.Render(w)
 }

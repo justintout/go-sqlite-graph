@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	graph "github.com/justintout/go-sqlite-graph"
 	"github.com/justintout/go-sqlite-graph/viz"
 )
 
@@ -129,6 +130,22 @@ func TestRenderContainsEdgeTypes(t *testing.T) {
 	for _, edgeType := range []string{"KNOWS", "WORKS_AT"} {
 		if !strings.Contains(html, edgeType) {
 			t.Errorf("expected HTML to contain edge type %q", edgeType)
+		}
+	}
+}
+
+func TestRenderDuplicateNames(t *testing.T) {
+	nodes := []*graph.Node{{ID: 1, Name: "Sam"}, {ID: 2, Name: "Sam"}}
+	edges := []*graph.Edge{{SourceID: 1, TargetID: 2, Type: "KNOWS"}}
+
+	var buf bytes.Buffer
+	if err := viz.New(nodes, edges).Render(&buf); err != nil {
+		t.Fatalf("render error: %v", err)
+	}
+	html := buf.String()
+	for _, want := range []string{`"id":"1"`, `"id":"2"`, `"source":"1"`, `"target":"2"`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("expected HTML to contain %s", want)
 		}
 	}
 }
