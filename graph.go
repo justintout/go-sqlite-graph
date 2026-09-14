@@ -1,3 +1,7 @@
+// Package graph is a labeled property graph database stored in SQLite.
+//
+// Nodes carry labels, a name, and JSON properties. Edges are directed and
+// typed. Match starts a query builder that compiles traversals to SQL.
 package graph
 
 import (
