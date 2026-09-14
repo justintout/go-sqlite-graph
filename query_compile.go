@@ -274,14 +274,25 @@ func writeHops(b *sqlBuilder, from string, r relStep, mode hopMode, cond string)
 func writeWheres(b *sqlBuilder, tableAlias string, wheres []whereClause) {
 	for _, w := range wheres {
 		b.w(" AND ")
+		list := w.op == "IN" || w.op == "NOT IN"
 		if w.isJSON {
 			// The path is bound, never interpolated, so any key is safe.
-			b.w(jsonExtractExpr(tableAlias, w.value), " ", w.op, " ?")
-			b.args = append(b.args, "$."+w.field, w.value)
-			continue
+			sample := w.value
+			if list {
+				sample = w.elem
+			}
+			b.w(jsonExtractExpr(tableAlias, sample))
+			b.args = append(b.args, "$."+w.field)
+		} else {
+			// w.field is checked against filterCols.
+			b.w(tableAlias, ".", w.field)
 		}
-		// w.field is checked against filterCols and w.op against validOps.
-		b.w(tableAlias, ".", w.field, " ", w.op, " ?")
+		// w.op is checked against validOps.
+		if list {
+			b.w(" ", w.op, " (SELECT value FROM json_each(?))")
+		} else {
+			b.w(" ", w.op, " ?")
+		}
 		b.args = append(b.args, w.value)
 	}
 }

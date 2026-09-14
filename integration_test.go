@@ -110,6 +110,40 @@ func TestMatchWhereJSON(t *testing.T) {
 	}
 }
 
+func TestWhereIn(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	buildSocialGraph(t, g)
+
+	cases := []struct {
+		name string
+		q    *Query
+		want []string
+	}{
+		{"column", g.Match("Person").Where("name", "in", []string{"Alice", "Eve", "Nobody"}), []string{"Alice", "Eve"}},
+		{"json ints", g.Match("Person").WhereJSON("age", "IN", []int{25, 40}), []string{"Bob", "Eve"}},
+		{"not in", g.Match("Person").WhereJSON("age", "NOT IN", []any{25, 30, 35}), []string{"Diana", "Eve"}},
+		{"rel", g.Match("Person").Where("name", "=", "Alice").Related("KNOWS", 1, 3).WhereRel("name", "IN", []string{"Bob", "Diana"}), []string{"Bob", "Diana"}},
+		{"empty", g.Match("Person").Where("name", "IN", []string{}), nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := c.q.Run(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			names := nodeNames(res.Nodes())
+			if len(names) != len(c.want) || !containsAll(names, c.want...) {
+				t.Errorf("got %v, want %v", names, c.want)
+			}
+		})
+	}
+
+	if _, err := g.Match("Person").Where("name", "IN", "Alice").Run(ctx); err == nil {
+		t.Error("IN accepted a non-slice value")
+	}
+}
+
 func TestSingleHopRelated(t *testing.T) {
 	g := openTestGraph(t)
 	ctx := context.Background()
