@@ -87,14 +87,20 @@ func createNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 	}
 
 	err = sqlitex.Execute(conn,
-		"INSERT INTO nodes (name, properties) VALUES (?, ?);",
-		&sqlitex.ExecOptions{Args: []any{n.Name, props}},
+		"INSERT INTO nodes (name, properties) VALUES (?, ?) RETURNING id, created_at, updated_at;",
+		&sqlitex.ExecOptions{
+			Args: []any{n.Name, props},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				n.ID = stmt.ColumnInt64(0)
+				n.CreatedAt = stmt.ColumnText(1)
+				n.UpdatedAt = stmt.ColumnText(2)
+				return nil
+			},
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: insert node: %w", err)
 	}
-
-	n.ID = conn.LastInsertRowID()
 
 	for _, label := range n.Labels {
 		err = sqlitex.Execute(conn,
@@ -104,22 +110,6 @@ func createNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 		if err != nil {
 			return fmt.Errorf("graph: insert label %q: %w", label, err)
 		}
-	}
-
-	// Read back timestamps
-	err = sqlitex.Execute(conn,
-		"SELECT created_at, updated_at FROM nodes WHERE id = ?;",
-		&sqlitex.ExecOptions{
-			Args: []any{n.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				n.CreatedAt = stmt.ColumnText(0)
-				n.UpdatedAt = stmt.ColumnText(1)
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: read timestamps: %w", err)
 	}
 
 	return nil
@@ -176,14 +166,22 @@ func updateNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	found := false
 	err = sqlitex.Execute(conn,
-		"UPDATE nodes SET name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?;",
-		&sqlitex.ExecOptions{Args: []any{n.Name, props, n.ID}},
+		"UPDATE nodes SET name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING updated_at;",
+		&sqlitex.ExecOptions{
+			Args: []any{n.Name, props, n.ID},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				found = true
+				n.UpdatedAt = stmt.ColumnText(0)
+				return nil
+			},
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: update node: %w", err)
 	}
-	if conn.Changes() == 0 {
+	if !found {
 		return fmt.Errorf("graph: node %d not found", n.ID)
 	}
 
@@ -204,21 +202,6 @@ func updateNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 		if err != nil {
 			return fmt.Errorf("graph: insert label %q: %w", label, err)
 		}
-	}
-
-	// Read back updated_at
-	err = sqlitex.Execute(conn,
-		"SELECT updated_at FROM nodes WHERE id = ?;",
-		&sqlitex.ExecOptions{
-			Args: []any{n.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				n.UpdatedAt = stmt.ColumnText(0)
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: read updated_at: %w", err)
 	}
 
 	return nil

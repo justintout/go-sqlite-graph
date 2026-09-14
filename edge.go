@@ -67,29 +67,19 @@ func createEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 	}
 
 	err = sqlitex.Execute(conn,
-		"INSERT INTO edges (source_id, target_id, type, name, properties) VALUES (?, ?, ?, ?, ?);",
-		&sqlitex.ExecOptions{Args: []any{e.SourceID, e.TargetID, e.Type, e.Name, props}},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: insert edge: %w", err)
-	}
-
-	e.ID = conn.LastInsertRowID()
-
-	// Read back timestamps
-	err = sqlitex.Execute(conn,
-		"SELECT created_at, updated_at FROM edges WHERE id = ?;",
+		"INSERT INTO edges (source_id, target_id, type, name, properties) VALUES (?, ?, ?, ?, ?) RETURNING id, created_at, updated_at;",
 		&sqlitex.ExecOptions{
-			Args: []any{e.ID},
+			Args: []any{e.SourceID, e.TargetID, e.Type, e.Name, props},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
-				e.CreatedAt = stmt.ColumnText(0)
-				e.UpdatedAt = stmt.ColumnText(1)
+				e.ID = stmt.ColumnInt64(0)
+				e.CreatedAt = stmt.ColumnText(1)
+				e.UpdatedAt = stmt.ColumnText(2)
 				return nil
 			},
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("graph: read timestamps: %w", err)
+		return fmt.Errorf("graph: insert edge: %w", err)
 	}
 
 	return nil
@@ -133,30 +123,23 @@ func updateEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	found := false
 	err = sqlitex.Execute(conn,
-		"UPDATE edges SET type = ?, name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?;",
-		&sqlitex.ExecOptions{Args: []any{e.Type, e.Name, props, e.ID}},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: update edge: %w", err)
-	}
-	if conn.Changes() == 0 {
-		return fmt.Errorf("graph: edge %d not found", e.ID)
-	}
-
-	// Read back updated_at
-	err = sqlitex.Execute(conn,
-		"SELECT updated_at FROM edges WHERE id = ?;",
+		"UPDATE edges SET type = ?, name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING updated_at;",
 		&sqlitex.ExecOptions{
-			Args: []any{e.ID},
+			Args: []any{e.Type, e.Name, props, e.ID},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
+				found = true
 				e.UpdatedAt = stmt.ColumnText(0)
 				return nil
 			},
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("graph: read updated_at: %w", err)
+		return fmt.Errorf("graph: update edge: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("graph: edge %d not found", e.ID)
 	}
 
 	return nil
