@@ -176,15 +176,11 @@ func (q *Query) Run(ctx context.Context) (*Result, error) {
 		return nil, q.err
 	}
 
-	compiled, err := q.compile()
-	if err != nil {
-		return nil, err
-	}
+	compiled := q.compile(false)
 
-	var conn *sqlite.Conn
-	if q.conn != nil {
-		conn = q.conn
-	} else {
+	conn := q.conn
+	if conn == nil {
+		var err error
 		conn, err = q.g.conn(ctx)
 		if err != nil {
 			return nil, err
@@ -201,15 +197,11 @@ func (q *Query) Count(ctx context.Context) (int64, error) {
 		return 0, q.err
 	}
 
-	compiled, err := q.compileCount()
-	if err != nil {
-		return 0, err
-	}
+	compiled := q.compile(true)
 
-	var conn *sqlite.Conn
-	if q.conn != nil {
-		conn = q.conn
-	} else {
+	conn := q.conn
+	if conn == nil {
+		var err error
 		conn, err = q.g.conn(ctx)
 		if err != nil {
 			return 0, err

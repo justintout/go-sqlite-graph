@@ -214,6 +214,52 @@ func TestWhereRelFilter(t *testing.T) {
 	}
 }
 
+func TestWhereRelIntermediateStep(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	buildSocialGraph(t, g)
+
+	// Alice knows Bob and Charlie within 2 hops; only Charlie passes the
+	// filter, and Charlie works nowhere.
+	res, err := g.Match("Person").
+		Where("name", "=", "Alice").
+		Related("KNOWS", 1, 2).
+		WhereRel("name", "=", "Charlie").
+		Related("WORKS_AT", 1, 1).
+		Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Len() != 0 {
+		t.Errorf("got %v, want none", nodeNames(res.Nodes()))
+	}
+}
+
+func TestBothDirection(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	buildSocialGraph(t, g)
+
+	for _, maxHops := range []int{1, 2} {
+		res, err := g.Match("Person").
+			Where("name", "=", "Charlie").
+			RelatedDir("KNOWS", Both, 1, maxHops).
+			Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := nodeNames(res.Nodes())
+		want := []string{"Bob", "Diana", "Eve"}
+		if maxHops == 2 {
+			// Alice via Bob; Charlie via any neighbor and back.
+			want = append(want, "Alice", "Charlie")
+		}
+		if len(names) != len(want) || !containsAll(names, want...) {
+			t.Errorf("maxHops=%d: got %v, want %v", maxHops, names, want)
+		}
+	}
+}
+
 func TestCycleHandling(t *testing.T) {
 	g := openTestGraph(t)
 	ctx := context.Background()
@@ -270,6 +316,14 @@ func TestLimit(t *testing.T) {
 	}
 	if res.Len() != 2 {
 		t.Errorf("got %d results, want 2", res.Len())
+	}
+
+	res, err = g.Match("Person").Offset(3).Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Len() != 2 {
+		t.Errorf("offset only: got %d results, want 2", res.Len())
 	}
 }
 

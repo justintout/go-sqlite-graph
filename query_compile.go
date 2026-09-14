@@ -13,326 +13,159 @@ type compiledQuery struct {
 	args []any
 }
 
-// Known node columns that map directly (not JSON).
-var knownNodeCols = map[string]bool{
-	"id": true, "name": true, "created_at": true, "updated_at": true, "properties": true,
-}
+const nodeCols = "n.id, n.name, n.created_at, n.updated_at, n.properties"
 
-func (q *Query) compile() (*compiledQuery, error) {
+// compile builds the SQL for q. With count set, it selects COUNT(*) and
+// ignores Limit and Offset.
+//
+// Traversals compile to a chain of CTEs, one per step, each yielding a set of
+// node IDs. Nodes are read only for the final set. Selecting full rows through
+// the joins would force SQLite to DISTINCT over the JSON properties text and to
+// scan the nodes table to probe the reached set. The set is joined as a
+// DISTINCT subquery rather than probed with IN, because IN builds a Bloom
+// filter whose allocation costs an mmap syscall per query under modernc.
+//
+// Joins from a step's set use CROSS JOIN, which SQLite never reorders. The
+// planner has no row estimates for CTEs and otherwise flattens the chain and
+// scans a whole edge index, probing the previous step's set per edge.
+//
+// LIMIT and OFFSET are bound parameters because zombiezen caches prepared
+// statements per connection by SQL text; interpolated values would grow that
+// cache without bound when paginating. The clause is omitted when unused:
+// a bound LIMIT makes SQLite re-prepare the statement on every execution.
+func (q *Query) compile(count bool) *compiledQuery {
 	c := &compiledQuery{}
-
-	if len(q.rels) == 0 {
-		return q.compileSimpleMatch(c)
-	}
-	return q.compileTraversal(c)
-}
-
-func (q *Query) compileCount() (*compiledQuery, error) {
-	c := &compiledQuery{}
-
-	if len(q.rels) == 0 {
-		return q.compileSimpleMatchCount(c)
-	}
-	return q.compileTraversalCount(c)
-}
-
-// compileSimpleMatch: no Related() steps, just a node label + where filter.
-func (q *Query) compileSimpleMatch(c *compiledQuery) (*compiledQuery, error) {
 	var sb strings.Builder
-	sb.WriteString("SELECT n.id, n.name, n.created_at, n.updated_at, n.properties")
-	sb.WriteString(" FROM nodes n")
-	sb.WriteString(" JOIN node_labels nl ON nl.node_id = n.id")
-	sb.WriteString(" WHERE nl.label = ?")
-	c.args = append(c.args, q.matchLabel)
 
-	for _, w := range q.wheres {
-		clause, arg := buildWhereExpr("n", w)
-		sb.WriteString(" AND ")
-		sb.WriteString(clause)
-		c.args = append(c.args, arg)
+	if len(q.rels) == 0 {
+		if count {
+			sb.WriteString("SELECT COUNT(*)")
+		} else {
+			sb.WriteString("SELECT " + nodeCols)
+		}
+		c.writeStartFrom(&sb, q)
+	} else {
+		sb.WriteString("WITH RECURSIVE s0(node_id) AS (SELECT n.id")
+		c.writeStartFrom(&sb, q)
+		sb.WriteString(")")
+
+		for i, r := range q.rels {
+			c.writeStep(&sb, i+1, r)
+		}
+
+		if count {
+			sb.WriteString(" SELECT COUNT(*)")
+		} else {
+			sb.WriteString(" SELECT " + nodeCols)
+		}
+		fmt.Fprintf(&sb, " FROM (SELECT DISTINCT node_id FROM s%d) s CROSS JOIN nodes n ON n.id = s.node_id", len(q.rels))
 	}
 
-	if q.limitVal > 0 {
-		sb.WriteString(fmt.Sprintf(" LIMIT %d", q.limitVal))
-	}
-	if q.offsetVal > 0 {
-		sb.WriteString(fmt.Sprintf(" OFFSET %d", q.offsetVal))
+	if !count && (q.limitVal > 0 || q.offsetVal > 0) {
+		sb.WriteString(" LIMIT ? OFFSET ?")
+		limit := q.limitVal
+		if limit <= 0 {
+			limit = -1
+		}
+		c.args = append(c.args, limit, max(q.offsetVal, 0))
 	}
 
 	c.sql = sb.String()
-	return c, nil
+	return c
 }
 
-func (q *Query) compileSimpleMatchCount(c *compiledQuery) (*compiledQuery, error) {
-	var sb strings.Builder
-	sb.WriteString("SELECT COUNT(*)")
-	sb.WriteString(" FROM nodes n")
-	sb.WriteString(" JOIN node_labels nl ON nl.node_id = n.id")
-	sb.WriteString(" WHERE nl.label = ?")
-	c.args = append(c.args, q.matchLabel)
-
+// writeStartFrom appends the FROM and WHERE clauses selecting the start nodes n.
+func (c *compiledQuery) writeStartFrom(sb *strings.Builder, q *Query) {
+	// Without ANALYZE statistics the planner rates the label and name indexes
+	// equally and drives from the label, scanning every node carrying it. A
+	// name equality is almost always more selective, so the unary + removes
+	// the label index from consideration and the label is checked by primary
+	// key per matched node.
+	label := "nl.label"
 	for _, w := range q.wheres {
-		clause, arg := buildWhereExpr("n", w)
-		sb.WriteString(" AND ")
-		sb.WriteString(clause)
-		c.args = append(c.args, arg)
-	}
-
-	c.sql = sb.String()
-	return c, nil
-}
-
-// compileTraversal handles queries with Related() steps.
-func (q *Query) compileTraversal(c *compiledQuery) (*compiledQuery, error) {
-	needsCTE := false
-	for _, r := range q.rels {
-		if r.maxHops > 1 {
-			needsCTE = true
+		if !w.isJSON && w.field == "name" && (w.op == "=" || w.op == "IS") {
+			label = "+nl.label"
 			break
 		}
 	}
-
-	if needsCTE {
-		return q.compileWithCTEs(c)
-	}
-	return q.compileSingleHopJoins(c)
-}
-
-func (q *Query) compileTraversalCount(c *compiledQuery) (*compiledQuery, error) {
-	// Build the same traversal but wrap it in COUNT
-	inner, err := q.compileTraversal(c)
-	if err != nil {
-		return nil, err
-	}
-	// Replace the SELECT columns with COUNT
-	// We wrap the whole thing as a subquery
-	inner.sql = fmt.Sprintf("SELECT COUNT(*) FROM (%s)", inner.sql)
-	return inner, nil
-}
-
-// compileSingleHopJoins: all Related() steps are exactly 1 hop, use simple JOINs.
-func (q *Query) compileSingleHopJoins(c *compiledQuery) (*compiledQuery, error) {
-	var sb strings.Builder
-
-	// Final node alias
-	lastAlias := fmt.Sprintf("n%d", len(q.rels))
-
-	sb.WriteString(fmt.Sprintf("SELECT DISTINCT %s.id, %s.name, %s.created_at, %s.updated_at, %s.properties",
-		lastAlias, lastAlias, lastAlias, lastAlias, lastAlias))
-	sb.WriteString(" FROM nodes n0")
-	sb.WriteString(" JOIN node_labels nl0 ON nl0.node_id = n0.id")
-
-	for i, r := range q.rels {
-		eAlias := fmt.Sprintf("e%d", i)
-		nAlias := fmt.Sprintf("n%d", i+1)
-		prevAlias := fmt.Sprintf("n%d", i)
-
-		switch r.direction {
-		case Outgoing:
-			sb.WriteString(fmt.Sprintf(" JOIN edges %s ON %s.source_id = %s.id AND %s.type = ?",
-				eAlias, eAlias, prevAlias, eAlias))
-			sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = %s.target_id",
-				nAlias, nAlias, eAlias))
-		case Incoming:
-			sb.WriteString(fmt.Sprintf(" JOIN edges %s ON %s.target_id = %s.id AND %s.type = ?",
-				eAlias, eAlias, prevAlias, eAlias))
-			sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = %s.source_id",
-				nAlias, nAlias, eAlias))
-		case Both:
-			sb.WriteString(fmt.Sprintf(" JOIN edges %s ON (%s.source_id = %s.id OR %s.target_id = %s.id) AND %s.type = ?",
-				eAlias, eAlias, prevAlias, eAlias, prevAlias, eAlias))
-			sb.WriteString(fmt.Sprintf(" JOIN nodes %s ON %s.id = CASE WHEN %s.source_id = %s.id THEN %s.target_id ELSE %s.source_id END",
-				nAlias, nAlias, eAlias, prevAlias, eAlias, eAlias))
-		}
-		c.args = append(c.args, r.edgeType)
-	}
-
-	sb.WriteString(" WHERE nl0.label = ?")
+	fmt.Fprintf(sb, " FROM nodes n JOIN node_labels nl ON nl.node_id = n.id WHERE %s = ?", label)
 	c.args = append(c.args, q.matchLabel)
-
-	// Append starting node wheres
-	for _, w := range q.wheres {
-		clause, arg := buildWhereExpr("n0", w)
-		sb.WriteString(" AND ")
-		sb.WriteString(clause)
-		c.args = append(c.args, arg)
-	}
-
-	// Append per-step node wheres
-	for i, r := range q.rels {
-		nAlias := fmt.Sprintf("n%d", i+1)
-		for _, w := range r.wheres {
-			clause, arg := buildWhereExpr(nAlias, w)
-			sb.WriteString(" AND ")
-			sb.WriteString(clause)
-			c.args = append(c.args, arg)
-		}
-	}
-
-	if q.limitVal > 0 {
-		sb.WriteString(fmt.Sprintf(" LIMIT %d", q.limitVal))
-	}
-	if q.offsetVal > 0 {
-		sb.WriteString(fmt.Sprintf(" OFFSET %d", q.offsetVal))
-	}
-
-	c.sql = sb.String()
-	return c, nil
+	c.writeWheres(sb, "n", q.wheres)
 }
 
-// compileWithCTEs: at least one Related() step has maxHops > 1.
-func (q *Query) compileWithCTEs(c *compiledQuery) (*compiledQuery, error) {
-	var sb strings.Builder
-
-	sb.WriteString("WITH RECURSIVE ")
-
-	for i, r := range q.rels {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-
-		stepName := fmt.Sprintf("step%d", i)
-
-		if r.maxHops == 1 {
-			// Non-recursive CTE for single-hop steps
-			q.writeSingleHopCTE(&sb, c, i, stepName, r)
-		} else {
-			// Recursive CTE for multi-hop steps
-			q.writeRecursiveCTE(&sb, c, i, stepName, r)
-		}
+// writeStep appends CTE s<i>(node_id): the nodes reached from s<i-1> by r.
+func (c *compiledQuery) writeStep(sb *strings.Builder, i int, r relStep) {
+	prev := fmt.Sprintf("s%d", i-1)
+	reached := fmt.Sprintf("s%d", i)
+	if len(r.wheres) > 0 {
+		reached = fmt.Sprintf("u%d", i)
 	}
 
-	// Final SELECT
-	lastStep := fmt.Sprintf("step%d", len(q.rels)-1)
-	lastRel := q.rels[len(q.rels)-1]
-
-	sb.WriteString(" SELECT DISTINCT n.id, n.name, n.created_at, n.updated_at, n.properties")
-	sb.WriteString(fmt.Sprintf(" FROM %s s", lastStep))
-	sb.WriteString(" JOIN nodes n ON n.id = s.node_id")
-
-	if lastRel.maxHops > 1 {
-		sb.WriteString(fmt.Sprintf(" WHERE s.depth >= %d AND s.depth <= %d", lastRel.minHops, lastRel.maxHops))
-	}
-
-	// Apply wheres on the final step's reached nodes
-	for _, w := range lastRel.wheres {
-		clause, arg := buildWhereExpr("n", w)
-		sb.WriteString(" AND ")
-		sb.WriteString(clause)
-		c.args = append(c.args, arg)
-	}
-
-	if q.limitVal > 0 {
-		sb.WriteString(fmt.Sprintf(" LIMIT %d", q.limitVal))
-	}
-	if q.offsetVal > 0 {
-		sb.WriteString(fmt.Sprintf(" OFFSET %d", q.offsetVal))
-	}
-
-	c.sql = sb.String()
-	return c, nil
-}
-
-func (q *Query) writeSingleHopCTE(sb *strings.Builder, c *compiledQuery, stepIdx int, stepName string, r relStep) {
-	sb.WriteString(fmt.Sprintf("%s(node_id) AS (", stepName))
-
-	if stepIdx == 0 {
-		// First step: source is the MATCH node
-		switch r.direction {
-		case Outgoing:
-			sb.WriteString("SELECT e.target_id FROM nodes n")
-			sb.WriteString(" JOIN node_labels nl ON nl.node_id = n.id")
-			sb.WriteString(" JOIN edges e ON e.source_id = n.id AND e.type = ?")
-		case Incoming:
-			sb.WriteString("SELECT e.source_id FROM nodes n")
-			sb.WriteString(" JOIN node_labels nl ON nl.node_id = n.id")
-			sb.WriteString(" JOIN edges e ON e.target_id = n.id AND e.type = ?")
-		case Both:
-			sb.WriteString("SELECT CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END FROM nodes n")
-			sb.WriteString(" JOIN node_labels nl ON nl.node_id = n.id")
-			sb.WriteString(" JOIN edges e ON (e.source_id = n.id OR e.target_id = n.id) AND e.type = ?")
-		}
-		sb.WriteString(" WHERE nl.label = ?")
-		c.args = append(c.args, r.edgeType, q.matchLabel)
-
-		for _, w := range q.wheres {
-			clause, arg := buildWhereExpr("n", w)
-			sb.WriteString(" AND ")
-			sb.WriteString(clause)
-			c.args = append(c.args, arg)
-		}
+	if r.maxHops == 1 {
+		fmt.Fprintf(sb, ", %s(node_id) AS (", reached)
+		c.writeHops(sb, prev, "", r)
+		sb.WriteString(")")
 	} else {
-		// Subsequent step: source is the previous step's result
-		prevStep := fmt.Sprintf("step%d", stepIdx-1)
-		prevRel := q.rels[stepIdx-1]
-
-		switch r.direction {
-		case Outgoing:
-			sb.WriteString(fmt.Sprintf("SELECT e.target_id FROM %s p", prevStep))
-			sb.WriteString(" JOIN edges e ON e.source_id = p.node_id AND e.type = ?")
-		case Incoming:
-			sb.WriteString(fmt.Sprintf("SELECT e.source_id FROM %s p", prevStep))
-			sb.WriteString(" JOIN edges e ON e.target_id = p.node_id AND e.type = ?")
-		case Both:
-			sb.WriteString(fmt.Sprintf("SELECT CASE WHEN e.source_id = p.node_id THEN e.target_id ELSE e.source_id END FROM %s p", prevStep))
-			sb.WriteString(" JOIN edges e ON (e.source_id = p.node_id OR e.target_id = p.node_id) AND e.type = ?")
-		}
-		c.args = append(c.args, r.edgeType)
-
-		if prevRel.maxHops > 1 {
-			sb.WriteString(fmt.Sprintf(" WHERE p.depth >= %d AND p.depth <= %d", prevRel.minHops, prevRel.maxHops))
-		}
+		// UNION deduplicates on (node_id, depth), which bounds the work per
+		// depth level by the node count and stops cycles.
+		walk := fmt.Sprintf("w%d", i)
+		fmt.Fprintf(sb, ", %s(node_id, depth) AS (SELECT node_id, 0 FROM %s UNION ", walk, prev)
+		c.writeHops(sb, walk, fmt.Sprintf("p.depth < %d", r.maxHops), r)
+		fmt.Fprintf(sb, "), %s(node_id) AS (SELECT node_id FROM %s WHERE depth >= %d)", reached, walk, r.minHops)
 	}
 
-	sb.WriteString(")")
+	if len(r.wheres) > 0 {
+		fmt.Fprintf(sb, ", s%d(node_id) AS (SELECT n.id FROM (SELECT DISTINCT node_id FROM %s) x CROSS JOIN nodes n ON n.id = x.node_id", i, reached)
+		c.writeWheres(sb, "n", r.wheres)
+		sb.WriteString(")")
+	}
 }
 
-func (q *Query) writeRecursiveCTE(sb *strings.Builder, c *compiledQuery, stepIdx int, stepName string, r relStep) {
-	sb.WriteString(fmt.Sprintf("%s(node_id, depth) AS (", stepName))
-
-	// Base case
-	if stepIdx == 0 {
-		// First step: base is the MATCH nodes at depth 0
-		sb.WriteString("SELECT n.id, 0 FROM nodes n")
-		sb.WriteString(" JOIN node_labels nl ON nl.node_id = n.id")
-		sb.WriteString(" WHERE nl.label = ?")
-		c.args = append(c.args, q.matchLabel)
-
-		for _, w := range q.wheres {
-			clause, arg := buildWhereExpr("n", w)
-			sb.WriteString(" AND ")
-			sb.WriteString(clause)
-			c.args = append(c.args, arg)
-		}
-	} else {
-		// Subsequent step: base is previous step's results
-		prevStep := fmt.Sprintf("step%d", stepIdx-1)
-		prevRel := q.rels[stepIdx-1]
-
-		sb.WriteString(fmt.Sprintf("SELECT p.node_id, 0 FROM %s p", prevStep))
-		if prevRel.maxHops > 1 {
-			sb.WriteString(fmt.Sprintf(" WHERE p.depth >= %d AND p.depth <= %d", prevRel.minHops, prevRel.maxHops))
-		}
-	}
-
-	sb.WriteString(" UNION ")
-
-	// Recursive case
+// writeHops appends a SELECT of one hop from table from along r. For a
+// recursive CTE, the SELECT also carries depth + 1 and the cond filter.
+// Both directions compile to two SELECTs joined by UNION ALL (UNION inside a
+// recursive CTE) so each side can use its covering index; an OR in the join
+// condition defeats index use.
+func (c *compiledQuery) writeHops(sb *strings.Builder, from, cond string, r relStep) {
+	type side struct{ near, far string }
+	var sides []side
 	switch r.direction {
 	case Outgoing:
-		sb.WriteString(fmt.Sprintf("SELECT e.target_id, t.depth + 1 FROM %s t", stepName))
-		sb.WriteString(" JOIN edges e ON e.source_id = t.node_id")
+		sides = []side{{"source_id", "target_id"}}
 	case Incoming:
-		sb.WriteString(fmt.Sprintf("SELECT e.source_id, t.depth + 1 FROM %s t", stepName))
-		sb.WriteString(" JOIN edges e ON e.target_id = t.node_id")
+		sides = []side{{"target_id", "source_id"}}
 	case Both:
-		sb.WriteString(fmt.Sprintf("SELECT CASE WHEN e.source_id = t.node_id THEN e.target_id ELSE e.source_id END, t.depth + 1 FROM %s t", stepName))
-		sb.WriteString(" JOIN edges e ON (e.source_id = t.node_id OR e.target_id = t.node_id)")
+		sides = []side{{"source_id", "target_id"}, {"target_id", "source_id"}}
 	}
-	sb.WriteString(fmt.Sprintf(" WHERE e.type = ? AND t.depth < %d", r.maxHops))
-	c.args = append(c.args, r.edgeType)
 
-	sb.WriteString(")")
+	recursive := cond != ""
+	for j, s := range sides {
+		if j > 0 {
+			if recursive {
+				sb.WriteString(" UNION ")
+			} else {
+				sb.WriteString(" UNION ALL ")
+			}
+		}
+		fmt.Fprintf(sb, "SELECT e.%s", s.far)
+		if recursive {
+			sb.WriteString(", p.depth + 1")
+		}
+		fmt.Fprintf(sb, " FROM %s p CROSS JOIN edges e ON e.%s = p.node_id AND e.type = ?", from, s.near)
+		if recursive {
+			sb.WriteString(" WHERE " + cond)
+		}
+		c.args = append(c.args, r.edgeType)
+	}
+}
+
+func (c *compiledQuery) writeWheres(sb *strings.Builder, tableAlias string, wheres []whereClause) {
+	for _, w := range wheres {
+		clause, arg := buildWhereExpr(tableAlias, w)
+		sb.WriteString(" AND ")
+		sb.WriteString(clause)
+		c.args = append(c.args, arg)
+	}
 }
 
 // buildWhereExpr builds a single WHERE expression clause and returns it with the bound arg.
