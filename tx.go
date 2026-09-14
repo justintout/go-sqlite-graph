@@ -9,6 +9,9 @@ import (
 )
 
 // Tx represents an explicit graph transaction.
+//
+// A method that returns an error may have applied part of its writes, such as
+// a node without its labels. Roll back the transaction after any error.
 type Tx struct {
 	g    *Graph
 	conn *sqlite.Conn

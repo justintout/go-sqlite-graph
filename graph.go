@@ -25,6 +25,10 @@ type Graph struct {
 	uri     string
 }
 
+// openFlags enables WAL so pooled readers do not block on, or get blocked by,
+// the single writer, and commits append to the log instead of rewriting pages.
+const openFlags = sqlite.OpenReadWrite | sqlite.OpenCreate | sqlite.OpenURI | sqlite.OpenWAL
+
 func prepareConn(conn *sqlite.Conn) error {
 	return sqlitex.ExecuteTransient(conn, "PRAGMA foreign_keys = ON;", nil)
 }
@@ -50,7 +54,7 @@ func Open(uri string, opts *Options) (*Graph, error) {
 	if autoMigrate {
 		pool := sqlitemigration.NewPool(uri, graphSchema(), sqlitemigration.Options{
 			PoolSize: poolSize,
-			Flags:    sqlite.OpenReadWrite | sqlite.OpenCreate | sqlite.OpenURI,
+			Flags:    openFlags,
 			PrepareConn: func(conn *sqlite.Conn) error {
 				return prepareConn(conn)
 			},
@@ -59,7 +63,7 @@ func Open(uri string, opts *Options) (*Graph, error) {
 	} else {
 		pool, err := sqlitex.NewPool(uri, sqlitex.PoolOptions{
 			PoolSize: poolSize,
-			Flags:    sqlite.OpenReadWrite | sqlite.OpenCreate | sqlite.OpenURI,
+			Flags:    openFlags,
 			PrepareConn: func(conn *sqlite.Conn) error {
 				return prepareConn(conn)
 			},

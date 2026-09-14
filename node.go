@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -78,23 +79,45 @@ func (g *Graph) RemoveLabels(ctx context.Context, nodeID int64, labels ...string
 	return removeLabelsInternal(conn, nodeID, labels)
 }
 
+// timestamp returns the current time in the format of the schema's
+// strftime('%Y-%m-%dT%H:%M:%fZ', 'now') column defaults. Writes bind it
+// instead of using RETURNING: SQLite buffers RETURNING rows in a temp table,
+// which spills to a temp file under a large transaction and made a 500k-edge
+// load 3x slower.
+func timestamp() string {
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// atomic makes a multi-statement write all-or-nothing when conn has no open
+// transaction; defer its result with the named error. Inside a transaction it
+// does nothing: the caller's transaction provides rollback, and a savepoint
+// there makes SQLite copy each touched page to the statement sub-journal,
+// which made bulk node inserts 5x slower.
+func atomic(conn *sqlite.Conn) func(*error) {
+	if conn.AutocommitEnabled() {
+		return sqlitex.Save(conn)
+	}
+	return func(*error) {}
+}
+
 func createNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
-	defer sqlitex.Save(conn)(&err)
+	defer atomic(conn)(&err)
 
 	props, err := MarshalProperties(n.Properties)
 	if err != nil {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	now := timestamp()
 	err = sqlitex.Execute(conn,
-		"INSERT INTO nodes (name, properties) VALUES (?, ?);",
-		&sqlitex.ExecOptions{Args: []any{n.Name, props}},
+		"INSERT INTO nodes (name, properties, created_at, updated_at) VALUES (?, ?, ?, ?);",
+		&sqlitex.ExecOptions{Args: []any{n.Name, props, now, now}},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: insert node: %w", err)
 	}
-
 	n.ID = conn.LastInsertRowID()
+	n.CreatedAt, n.UpdatedAt = now, now
 
 	for _, label := range n.Labels {
 		err = sqlitex.Execute(conn,
@@ -104,22 +127,6 @@ func createNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 		if err != nil {
 			return fmt.Errorf("graph: insert label %q: %w", label, err)
 		}
-	}
-
-	// Read back timestamps
-	err = sqlitex.Execute(conn,
-		"SELECT created_at, updated_at FROM nodes WHERE id = ?;",
-		&sqlitex.ExecOptions{
-			Args: []any{n.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				n.CreatedAt = stmt.ColumnText(0)
-				n.UpdatedAt = stmt.ColumnText(1)
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: read timestamps: %w", err)
 	}
 
 	return nil
@@ -169,16 +176,17 @@ func getNodeInternal(conn *sqlite.Conn, id int64) (*Node, error) {
 }
 
 func updateNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
-	defer sqlitex.Save(conn)(&err)
+	defer atomic(conn)(&err)
 
 	props, err := MarshalProperties(n.Properties)
 	if err != nil {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	now := timestamp()
 	err = sqlitex.Execute(conn,
-		"UPDATE nodes SET name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?;",
-		&sqlitex.ExecOptions{Args: []any{n.Name, props, n.ID}},
+		"UPDATE nodes SET name = ?, properties = ?, updated_at = ? WHERE id = ?;",
+		&sqlitex.ExecOptions{Args: []any{n.Name, props, now, n.ID}},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: update node: %w", err)
@@ -186,6 +194,7 @@ func updateNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 	if conn.Changes() == 0 {
 		return fmt.Errorf("graph: node %d not found", n.ID)
 	}
+	n.UpdatedAt = now
 
 	// Sync labels: delete all, re-insert
 	err = sqlitex.Execute(conn,
@@ -206,21 +215,6 @@ func updateNodeInternal(conn *sqlite.Conn, n *Node) (err error) {
 		}
 	}
 
-	// Read back updated_at
-	err = sqlitex.Execute(conn,
-		"SELECT updated_at FROM nodes WHERE id = ?;",
-		&sqlitex.ExecOptions{
-			Args: []any{n.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				n.UpdatedAt = stmt.ColumnText(0)
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: read updated_at: %w", err)
-	}
-
 	return nil
 }
 
@@ -239,7 +233,7 @@ func deleteNodeInternal(conn *sqlite.Conn, id int64) error {
 }
 
 func addLabelsInternal(conn *sqlite.Conn, nodeID int64, labels []string) (err error) {
-	defer sqlitex.Save(conn)(&err)
+	defer atomic(conn)(&err)
 	for _, label := range labels {
 		err = sqlitex.Execute(conn,
 			"INSERT OR IGNORE INTO node_labels (node_id, label) VALUES (?, ?);",
@@ -253,7 +247,7 @@ func addLabelsInternal(conn *sqlite.Conn, nodeID int64, labels []string) (err er
 }
 
 func removeLabelsInternal(conn *sqlite.Conn, nodeID int64, labels []string) (err error) {
-	defer sqlitex.Save(conn)(&err)
+	defer atomic(conn)(&err)
 	for _, label := range labels {
 		err = sqlitex.Execute(conn,
 			"DELETE FROM node_labels WHERE node_id = ? AND label = ?;",

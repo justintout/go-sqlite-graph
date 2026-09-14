@@ -339,3 +339,191 @@ func BenchmarkMatchSimple(b *testing.B) {
 		})
 	}
 }
+
+// buildRandomGraphTx creates n "Node" nodes, each with `degree` random outgoing
+// LINK edges, inside a single transaction. Node i gets props(i) as properties.
+// Returns node IDs.
+func buildRandomGraphTx(b *testing.B, g *Graph, n, degree int, props func(i int) map[string]any) []int64 {
+	b.Helper()
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(42))
+
+	tx, err := g.BeginTx(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	ids := make([]int64, n)
+	for i := range n {
+		node := &Node{Name: fmt.Sprintf("n%d", i), Labels: []string{"Node"}, Properties: props(i)}
+		if err := tx.CreateNode(ctx, node); err != nil {
+			b.Fatal(err)
+		}
+		ids[i] = node.ID
+	}
+	for i := range n {
+		for range degree {
+			if err := tx.CreateEdge(ctx, &Edge{SourceID: ids[i], TargetID: ids[rng.Intn(n)], Type: "LINK"}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	return ids
+}
+
+// BenchmarkTraversalLarge measures traversals on a 10k-node random graph with
+// 3 outgoing edges per node, where per-step cost should not grow with edge count.
+func BenchmarkTraversalLarge(b *testing.B) {
+	g := openBenchGraph(b)
+	buildRandomGraphTx(b, g, 10000, 3, func(i int) map[string]any { return map[string]any{"idx": i} })
+	ctx := context.Background()
+
+	cases := []struct {
+		name     string
+		dir      Direction
+		min, max int
+	}{
+		{"out/hops=1", Outgoing, 1, 1},
+		{"out/hops=2", Outgoing, 1, 2},
+		{"out/hops=3", Outgoing, 1, 3},
+		{"out/hops=4", Outgoing, 1, 4},
+		{"out/hops=6", Outgoing, 1, 6},
+		{"out/hops=3-6", Outgoing, 3, 6},
+		{"both/hops=1", Both, 1, 1},
+		{"both/hops=3", Both, 1, 3},
+		{"both/hops=4", Both, 1, 4},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			for range b.N {
+				res, err := g.Match("Node").
+					Where("name", "=", "n0").
+					RelatedDir("LINK", c.dir, c.min, c.max).
+					Run(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Len() == 0 {
+					b.Fatal("expected results")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkCreateNodeFile measures autocommit node creation against an on-disk database.
+func BenchmarkCreateNodeFile(b *testing.B) {
+	g, err := Open("file:"+b.TempDir()+"/bench.db", &Options{PoolSize: 2})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { g.Close() })
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := range b.N {
+		n := &Node{Name: fmt.Sprintf("n%d", i), Labels: []string{"Bench"}, Properties: map[string]any{"i": i}}
+		if err := g.CreateNode(ctx, n); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkReturn measures projecting columns and property paths with Return
+// against returning whole nodes, on a 6-hop traversal reaching ~700 nodes that
+// each carry a 10-key property document.
+func BenchmarkReturn(b *testing.B) {
+	g := openBenchGraph(b)
+	buildRandomGraphTx(b, g, 10000, 3, func(i int) map[string]any {
+		return map[string]any{
+			"idx": i, "email": fmt.Sprintf("user%d@example.com", i), "active": i%2 == 0,
+			"score": float64(i) / 7, "city": "Springfield", "country": "US",
+			"tags": []string{"a", "b", "c"}, "bio": "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+			"address": map[string]any{"street": "742 Evergreen Terrace", "zip": "49007"}, "version": 3,
+		}
+	})
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		cols []string
+	}{
+		{"all", nil},
+		{"id", []string{"id"}},
+		{"name", []string{"name"}},
+		{"name+2props", []string{"name", "email", "score"}},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			for range b.N {
+				q := g.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 6)
+				if c.cols != nil {
+					q = q.Return(c.cols...)
+				}
+				res, err := q.Run(ctx)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Len() == 0 {
+					b.Fatal("expected results")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkBreadthFirst compares the default walk with BreadthFirst on graph
+// shapes where each wins: chains and trees never revisit nodes, while dense
+// graphs with cycles revisit them at many depths.
+func BenchmarkBreadthFirst(b *testing.B) {
+	ctx := context.Background()
+	chain := openBenchGraph(b)
+	buildChainGraph(b, chain, 100)
+	tree := openBenchGraph(b)
+	buildFanoutGraph(b, tree, 6, 3)
+	dense := openBenchGraph(b)
+	buildDenseGraph(b, dense, 500, 5)
+	large := openBenchGraph(b)
+	buildRandomGraphTx(b, large, 10000, 3, func(i int) map[string]any { return nil })
+
+	cases := []struct {
+		name  string
+		query func() *Query
+	}{
+		{"chain/hops=10", func() *Query { return chain.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 10) }},
+		{"tree/depth=6", func() *Query { return tree.Match("Root").Related("CHILD", 1, 6) }},
+		{"dense/hops=5", func() *Query { return dense.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 5) }},
+		{"dense/hops=10", func() *Query { return dense.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 10) }},
+		{"large/out/hops=6", func() *Query { return large.Match("Node").Where("name", "=", "n0").Related("LINK", 1, 6) }},
+		{"large/both/hops=4", func() *Query {
+			return large.Match("Node").Where("name", "=", "n0").RelatedDir("LINK", Both, 1, 4)
+		}},
+	}
+	for _, c := range cases {
+		for _, bfs := range []bool{false, true} {
+			name := c.name + "/default"
+			if bfs {
+				name = c.name + "/breadth-first"
+			}
+			b.Run(name, func(b *testing.B) {
+				for range b.N {
+					q := c.query()
+					if bfs {
+						q = q.BreadthFirst()
+					}
+					res, err := q.Run(ctx)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if res.Len() == 0 {
+						b.Fatal("expected results")
+					}
+				}
+			})
+		}
+	}
+}

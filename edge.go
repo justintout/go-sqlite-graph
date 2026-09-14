@@ -66,31 +66,16 @@ func createEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	now := timestamp()
 	err = sqlitex.Execute(conn,
-		"INSERT INTO edges (source_id, target_id, type, name, properties) VALUES (?, ?, ?, ?, ?);",
-		&sqlitex.ExecOptions{Args: []any{e.SourceID, e.TargetID, e.Type, e.Name, props}},
+		"INSERT INTO edges (source_id, target_id, type, name, properties, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+		&sqlitex.ExecOptions{Args: []any{e.SourceID, e.TargetID, e.Type, e.Name, props, now, now}},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: insert edge: %w", err)
 	}
-
 	e.ID = conn.LastInsertRowID()
-
-	// Read back timestamps
-	err = sqlitex.Execute(conn,
-		"SELECT created_at, updated_at FROM edges WHERE id = ?;",
-		&sqlitex.ExecOptions{
-			Args: []any{e.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				e.CreatedAt = stmt.ColumnText(0)
-				e.UpdatedAt = stmt.ColumnText(1)
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: read timestamps: %w", err)
-	}
+	e.CreatedAt, e.UpdatedAt = now, now
 
 	return nil
 }
@@ -133,9 +118,10 @@ func updateEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	now := timestamp()
 	err = sqlitex.Execute(conn,
-		"UPDATE edges SET type = ?, name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?;",
-		&sqlitex.ExecOptions{Args: []any{e.Type, e.Name, props, e.ID}},
+		"UPDATE edges SET type = ?, name = ?, properties = ?, updated_at = ? WHERE id = ?;",
+		&sqlitex.ExecOptions{Args: []any{e.Type, e.Name, props, now, e.ID}},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: update edge: %w", err)
@@ -143,21 +129,7 @@ func updateEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 	if conn.Changes() == 0 {
 		return fmt.Errorf("graph: edge %d not found", e.ID)
 	}
-
-	// Read back updated_at
-	err = sqlitex.Execute(conn,
-		"SELECT updated_at FROM edges WHERE id = ?;",
-		&sqlitex.ExecOptions{
-			Args: []any{e.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				e.UpdatedAt = stmt.ColumnText(0)
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("graph: read updated_at: %w", err)
-	}
+	e.UpdatedAt = now
 
 	return nil
 }
