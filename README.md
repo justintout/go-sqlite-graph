@@ -168,7 +168,7 @@ g.Match("Person").
 // Return only some columns and property paths.
 g.Match("Person").
     Related("KNOWS", 1, 3).
-    Return("name", "age").
+    Return("name", "labels", "age").
     Run(ctx)
 
 // Count and paginate.
@@ -182,7 +182,7 @@ The operators are `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`, `NOT LIKE`, `IN
 
 A step takes between 1 and `graph.MaxHops` (10) hops. A start node is in the result only if the step reaches it, for example through a cycle. Cycles do not loop forever: a walk expands each node at most once per depth.
 
-Query results populate the node columns and properties. They do not populate `Labels`, and they do not return edges. `Return` sets `ID` plus the named fields. It sets a property path as a key in `Properties` and leaves every other field zero. Returning fewer fields skips JSON decoding, which is a large share of the cost of big traversals.
+By default, query results populate every `Node` field except `Labels`, because reading labels makes queries about 40% slower. Select them with `Return`. Query results do not return edges. `Return` sets `ID` plus the named fields: `name`, `labels`, `created_at`, `updated_at`, `properties`, or a property path. A property whose name matches one of those columns can only be filtered, not returned. It sets a property path as a key in `Properties` and leaves every other field zero. Returning fewer fields skips JSON decoding, which is a large share of the cost of big traversals.
 
 `Count` ignores `Limit` and `Offset`.
 

@@ -206,11 +206,12 @@ func (q *Query) whereRel(field, op string, value any, isJSON bool) *Query {
 }
 
 // Return specifies which columns/properties to project in results.
-// Known columns (name, created_at, updated_at, properties) map to Node fields.
+// Known columns (name, labels, created_at, updated_at, properties) map to Node fields.
 // Other names are treated as JSON property paths and set in Node.Properties
 // under the name as given; paths missing from a node are omitted. Node.ID is
 // always set. Fields not returned are left zero, and Properties is nil unless
-// properties or a path is returned. Without Return, all columns are returned.
+// properties or a path is returned. Without Return, every field except Labels
+// is returned.
 func (q *Query) Return(cols ...string) *Query {
 	for _, c := range cols {
 		if c == "" {

@@ -32,9 +32,15 @@ func (b *sqlBuilder) w(parts ...string) {
 	}
 }
 
+// allCols is the default projection. It omits labels: reading them runs a
+// subquery and decodes a JSON array per node, which made traversals ~40%
+// slower. Return("labels") selects them.
 var allCols = []string{"name", "created_at", "updated_at", "properties"}
 
-var knownNodeCols = map[string]bool{"name": true, "created_at": true, "updated_at": true, "properties": true}
+var knownNodeCols = map[string]bool{"name": true, "labels": true, "created_at": true, "updated_at": true, "properties": true}
+
+// labelsExpr selects a node's labels as a JSON array, sorted like GetNode.
+const labelsExpr = "(SELECT json_group_array(label) FROM (SELECT label FROM node_labels WHERE node_id = n.id ORDER BY label))"
 
 // compile builds the SQL for q. With count set, it selects COUNT(*) and
 // ignores Limit and Offset.
@@ -113,6 +119,10 @@ func (c *compiledQuery) writeSelect(b *sqlBuilder, q *Query, count bool) {
 
 	b.w("SELECT n.id")
 	for _, col := range c.cols {
+		if col == "labels" {
+			b.w(", ", labelsExpr)
+			continue
+		}
 		if knownNodeCols[col] {
 			b.w(", n.", col)
 			continue
@@ -323,6 +333,12 @@ func (c *compiledQuery) execute(conn *sqlite.Conn) (*Result, error) {
 				switch col {
 				case "name":
 					n.Name = stmt.ColumnText(i)
+				case "labels":
+					if text := stmt.ColumnText(i); text != "[]" {
+						if err := json.Unmarshal([]byte(text), &n.Labels); err != nil {
+							return fmt.Errorf("graph: decode labels: %w", err)
+						}
+					}
 				case "created_at":
 					n.CreatedAt = stmt.ColumnText(i)
 				case "updated_at":

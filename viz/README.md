@@ -51,6 +51,7 @@ c.Render(f)
 result, _ := g.Match("Person").
     Where("name", "=", "Alice").
     Related("KNOWS", 1, 3).
+    Return("name", "labels").
     Run(ctx)
 
 c := viz.NewFromResult(result, edges)
@@ -77,7 +78,7 @@ http.ListenAndServe(":8080", nil)
 
 ## How it works
 
-- Each node's first label determines its color category. Nodes without labels are grouped as "(unlabeled)".
+- Each node's first label determines its color category. Nodes without labels are grouped as "(unlabeled)". Queries return labels only when asked, so pass `Return("name", "labels")` to a query whose result you render.
 - Colors cycle through the palette when there are more categories than colors.
 - Edge `Type` fields are displayed as edge labels.
 - Edges referencing nodes not in the provided slice are silently skipped.

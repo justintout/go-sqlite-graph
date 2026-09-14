@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand"
+	"slices"
 	"testing"
 )
 
@@ -353,6 +354,22 @@ func TestReturn(t *testing.T) {
 		}
 		if len(n.Properties) != 1 || n.Properties["age"] != float64(30) {
 			t.Errorf("properties = %v, want map[age:30]", n.Properties)
+		}
+	}
+
+	if err := g.AddLabels(ctx, alice.ID, "Engineer"); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []*Query{
+		g.Match("Person").Where("name", "=", "Alice").Return("labels"),
+		g.Match("Company").RelatedDir("WORKS_AT", Incoming, 1, 1).WhereRel("name", "=", "Alice").Return("labels"),
+	} {
+		res, err := q.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Nodes()[0].Labels; !slices.Equal(got, []string{"Engineer", "Person"}) {
+			t.Errorf("labels = %v, want [Engineer Person]", got)
 		}
 	}
 
