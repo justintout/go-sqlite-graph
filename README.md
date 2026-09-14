@@ -107,7 +107,7 @@ All CRUD methods are available on both `*Graph` and `*Tx`.
 
 ### Query builder
 
-The query builder compiles to SQL. Simple matches use JOINs; multi-hop traversals use recursive CTEs. Cycles are handled safely via `UNION` deduplication with a configurable depth cap (max 10 hops).
+The query builder compiles to SQL. Each traversal step compiles to a CTE of node IDs; multi-hop steps use recursive CTEs. Cycles are handled safely via `UNION` deduplication with a configurable depth cap (max 10 hops).
 
 ```go
 // Match by label.
@@ -119,13 +119,13 @@ g.Match("Person").Where("name", "=", "Alice").Run(ctx)
 // Filter on JSON properties.
 g.Match("Person").WhereJSON("age", ">", 30).Run(ctx)
 
-// Single-hop traversal (compiles to JOIN).
+// Single-hop traversal.
 g.Match("Person").
     Where("name", "=", "Alice").
     Related("KNOWS", 1, 1).
     Run(ctx)
 
-// Multi-hop traversal (compiles to recursive CTE).
+// Multi-hop traversal (recursive CTE).
 g.Match("Person").
     Where("name", "=", "Alice").
     Related("KNOWS", 1, 3).
@@ -180,42 +180,40 @@ count := res.Len()
 go test -bench=. -benchmem ./...
 ```
 
-Results on Apple M3 Max:
+Results on Apple M3 Max, in-memory database unless noted:
 
 ```
-BenchmarkTraversalChain/hops=1      37976     31510 ns/op     2707 B/op     61 allocs/op
-BenchmarkTraversalChain/hops=2      15195     79016 ns/op     4170 B/op     70 allocs/op
-BenchmarkTraversalChain/hops=3      12860     93882 ns/op     4917 B/op     86 allocs/op
-BenchmarkTraversalChain/hops=5      10000    115139 ns/op     6408 B/op    117 allocs/op
-BenchmarkTraversalChain/hops=10      6820    175823 ns/op    10102 B/op    194 allocs/op
+BenchmarkTraversalChain/hops=1          8.8µs      2804 B/op     50 allocs/op  (100-node chain)
+BenchmarkTraversalChain/hops=10        32.6µs      9542 B/op    195 allocs/op
 
-BenchmarkTraversalFanout/depth=2    18614     64336 ns/op    11518 B/op    217 allocs/op  (13 nodes)
-BenchmarkTraversalFanout/depth=4      926   1307569 ns/op    92186 B/op   1840 allocs/op  (121 nodes)
-BenchmarkTraversalFanout/depth=6       12  93185375 ns/op   828125 B/op  16426 allocs/op  (1093 nodes)
+BenchmarkTraversalFanout/depth=2       33.6µs     10956 B/op    218 allocs/op  (13 nodes)
+BenchmarkTraversalFanout/depth=4      195.5µs     91629 B/op   1841 allocs/op  (121 nodes)
+BenchmarkTraversalFanout/depth=6       1.88ms    827562 B/op  16426 allocs/op  (1093 nodes)
 
-BenchmarkTraversalDense/hops=1       3205    378662 ns/op     5734 B/op    129 allocs/op  (500 nodes, 5 edges/node)
-BenchmarkTraversalDense/hops=2        220   5481183 ns/op    25130 B/op    524 allocs/op
-BenchmarkTraversalDense/hops=3         45  25483407 ns/op   104028 B/op   2218 allocs/op
-BenchmarkTraversalDense/hops=5          5 209771308 ns/op   366190 B/op   7815 allocs/op
-BenchmarkTraversalDense/hops=10         2 931694438 ns/op   375852 B/op   8013 allocs/op
+BenchmarkTraversalDense/hops=1         16.6µs      5850 B/op    118 allocs/op  (500 nodes, 5 edges/node)
+BenchmarkTraversalDense/hops=3        278.2µs    103407 B/op   2218 allocs/op
+BenchmarkTraversalDense/hops=10        9.79ms    374402 B/op   8008 allocs/op
 
-BenchmarkCreateNode                 78876     15556 ns/op     1817 B/op     38 allocs/op
-BenchmarkCreateEdge                 83337     15518 ns/op      818 B/op     19 allocs/op
-BenchmarkBulkInsertTx/batch=10       6548    204779 ns/op    14577 B/op    382 allocs/op
-BenchmarkBulkInsertTx/batch=100       715   1800590 ns/op   141614 B/op   3801 allocs/op
-BenchmarkBulkInsertTx/batch=1000       70  16154103 ns/op  1437031 B/op  39484 allocs/op
+BenchmarkTraversalLarge/out/hops=1     14.0µs      4322 B/op     85 allocs/op  (10k nodes, 3 edges/node)
+BenchmarkTraversalLarge/out/hops=3     99.9µs     31605 B/op    670 allocs/op
+BenchmarkTraversalLarge/out/hops=6     2.55ms    759353 B/op  16290 allocs/op
+BenchmarkTraversalLarge/both/hops=1    21.1µs      6650 B/op    138 allocs/op
+BenchmarkTraversalLarge/both/hops=3   487.2µs    165757 B/op   3523 allocs/op
 
-BenchmarkMatchSimple/nodes=100      51266     23259 ns/op     1525 B/op     29 allocs/op
-BenchmarkMatchSimple/nodes=1000      7406    164950 ns/op     1523 B/op     29 allocs/op
-BenchmarkMatchSimple/nodes=10000      786   1526852 ns/op     1526 B/op     29 allocs/op
+BenchmarkMatchSimple/nodes=100          4.2µs      1623 B/op     31 allocs/op
+BenchmarkMatchSimple/nodes=10000        4.6µs      1623 B/op     31 allocs/op
+
+BenchmarkCreateNode                    16.2µs      1802 B/op     36 allocs/op
+BenchmarkCreateNodeFile                76.4µs      1808 B/op     35 allocs/op  (on disk, WAL)
+BenchmarkCreateEdge                    10.9µs       802 B/op     17 allocs/op
+BenchmarkBulkInsertTx/batch=1000      18.32ms   1406150 B/op  35446 allocs/op
 ```
 
 Key takeaways:
-- **Chain traversal** scales linearly with hop depth (~31us at 1 hop to ~176us at 10 hops on a 100-node chain).
-- **Fanout traversal** scales with the number of nodes reached; a depth-6 tree with fanout 3 (1093 nodes) takes ~93ms.
-- **Dense graph traversal** is the most expensive — on a 500-node graph with 5 edges/node, the reachable set explodes quickly. The `UNION` deduplication in the CTE prevents infinite loops but can't prevent visiting the full reachable set.
-- **Simple match** scales linearly with table size (SQLite index scan).
-- **Bulk insert** throughput is ~16ms for 1000 nodes+edges in a single transaction (~62k inserts/sec).
+- **Traversal cost tracks the reached set**, not the graph size. Each hop is a covering-index lookup, so one hop costs about the same on a 100-node chain and a 10k-node graph.
+- **Dense graph traversal** is the most expensive. `UNION` deduplicates on (node, depth), so a node reachable at several depths is expanded once per depth.
+- **Result decoding** is a large share of big traversals: each node's JSON properties are unmarshaled into a map.
+- **Name matches** use an index and do not grow with label size.
 
 ## License
 
