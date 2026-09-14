@@ -2,8 +2,6 @@ module github.com/justintout/go-sqlite-graph/bench/compare
 
 go 1.23.0
 
-replace github.com/justintout/go-sqlite-graph => ../..
-
 require (
 	github.com/justintout/go-sqlite-graph v0.0.0-20260714170249-4e85730c39e9
 	github.com/mattn/go-sqlite3 v1.14.52
