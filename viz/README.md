@@ -45,17 +45,31 @@ defer f.Close()
 c.Render(f)
 ```
 
-### From a query result
+### From a query
 
 ```go
-result, _ := g.Match("Person").
+q := g.Match("Person").
     Where("name", "=", "Alice").
-    Related("KNOWS", 1, 3).
-    Return("name", "labels").
-    Run(ctx)
+    Related("KNOWS", 1, 3)
 
-c := viz.NewFromResult(result, edges)
+c, err := viz.FromQuery(ctx, g, q, viz.WithTitle("Alice's network"))
 c.Render(os.Stdout)
+```
+
+`FromQuery` runs the query with labels selected, then reads every edge between the returned nodes. Pass a `*graph.Tx` instead of the `*graph.Graph` when the query came from that transaction.
+
+To choose the edges, build the chart with `New`:
+
+```go
+res, _ := q.WithLabels().Run(ctx)
+nodes := res.Nodes()
+ids := make([]int64, len(nodes))
+for i, n := range nodes {
+    ids[i] = n.ID
+}
+edges, _ := g.EdgesBetween(ctx, ids, "KNOWS")
+
+c := viz.New(nodes, edges)
 ```
 
 ### HTTP handler
@@ -78,7 +92,7 @@ http.ListenAndServe(":8080", nil)
 
 ## How it works
 
-- Each node's first label determines its color category. Nodes without labels are grouped as "(unlabeled)". Queries return labels only when asked, so pass `Return("name", "labels")` to a query whose result you render.
+- Each node's first label determines its color category. Nodes without labels are grouped as "(unlabeled)". Queries return labels only when asked: `FromQuery` asks for them, and with `New` use `WithLabels` on the query.
 - Colors cycle through the palette when there are more categories than colors.
 - Edge `Type` fields are displayed as edge labels.
 - Edges referencing nodes not in the provided slice are silently skipped.

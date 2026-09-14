@@ -2,6 +2,7 @@
 package viz
 
 import (
+	"context"
 	"io"
 	"net/http"
 
@@ -69,9 +70,31 @@ func New(nodes []*graph.Node, edges []*graph.Edge, options ...Option) *Chart {
 	return c
 }
 
-// NewFromResult creates a Chart from a query Result and edges.
-func NewFromResult(result *graph.Result, edges []*graph.Edge, options ...Option) *Chart {
-	return New(result.Nodes(), edges, options...)
+// EdgeReader reads the edges between a set of nodes. *graph.Graph and
+// *graph.Tx implement it.
+type EdgeReader interface {
+	EdgesBetween(ctx context.Context, nodeIDs []int64, types ...string) ([]*graph.Edge, error)
+}
+
+// FromQuery runs q with labels selected and creates a Chart of its nodes and
+// every edge between them, read from db. When q was started from a Tx, pass
+// that Tx as db so the edges come from the same transaction. Use New to
+// choose the nodes or edges yourself.
+func FromQuery(ctx context.Context, db EdgeReader, q *graph.Query, options ...Option) (*Chart, error) {
+	res, err := q.WithLabels().Run(ctx)
+	if err != nil {
+		return nil, err
+	}
+	nodes := res.Nodes()
+	ids := make([]int64, len(nodes))
+	for i, n := range nodes {
+		ids[i] = n.ID
+	}
+	edges, err := db.EdgesBetween(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	return New(nodes, edges, options...), nil
 }
 
 // Render writes the chart as a self-contained HTML page to w.
