@@ -66,21 +66,16 @@ func createEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
+	now := timestamp()
 	err = sqlitex.Execute(conn,
-		"INSERT INTO edges (source_id, target_id, type, name, properties) VALUES (?, ?, ?, ?, ?) RETURNING id, created_at, updated_at;",
-		&sqlitex.ExecOptions{
-			Args: []any{e.SourceID, e.TargetID, e.Type, e.Name, props},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				e.ID = stmt.ColumnInt64(0)
-				e.CreatedAt = stmt.ColumnText(1)
-				e.UpdatedAt = stmt.ColumnText(2)
-				return nil
-			},
-		},
+		"INSERT INTO edges (source_id, target_id, type, name, properties, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+		&sqlitex.ExecOptions{Args: []any{e.SourceID, e.TargetID, e.Type, e.Name, props, now, now}},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: insert edge: %w", err)
 	}
+	e.ID = conn.LastInsertRowID()
+	e.CreatedAt, e.UpdatedAt = now, now
 
 	return nil
 }
@@ -123,24 +118,18 @@ func updateEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 		return fmt.Errorf("graph: marshal properties: %w", err)
 	}
 
-	found := false
+	now := timestamp()
 	err = sqlitex.Execute(conn,
-		"UPDATE edges SET type = ?, name = ?, properties = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? RETURNING updated_at;",
-		&sqlitex.ExecOptions{
-			Args: []any{e.Type, e.Name, props, e.ID},
-			ResultFunc: func(stmt *sqlite.Stmt) error {
-				found = true
-				e.UpdatedAt = stmt.ColumnText(0)
-				return nil
-			},
-		},
+		"UPDATE edges SET type = ?, name = ?, properties = ?, updated_at = ? WHERE id = ?;",
+		&sqlitex.ExecOptions{Args: []any{e.Type, e.Name, props, now, e.ID}},
 	)
 	if err != nil {
 		return fmt.Errorf("graph: update edge: %w", err)
 	}
-	if !found {
+	if conn.Changes() == 0 {
 		return fmt.Errorf("graph: edge %d not found", e.ID)
 	}
+	e.UpdatedAt = now
 
 	return nil
 }
