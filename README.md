@@ -145,10 +145,18 @@ g.Match("Person").
     RelatedDir("KNOWS", graph.Incoming, 1, 1). // who knows Bob?
     Run(ctx)
 
+// Project columns and property paths; unreturned fields stay zero.
+g.Match("Person").
+    Related("KNOWS", 1, 3).
+    Return("name", "age").
+    Run(ctx)
+
 // Count and pagination.
 count, _ := g.Match("Person").Count(ctx)
 results, _ := g.Match("Person").Limit(10).Offset(20).Run(ctx)
 ```
+
+`Where` and `WhereRel` accept the node columns `id`, `name`, `created_at`, `updated_at`, and `properties`. Filter properties with `WhereJSON` and `WhereRelJSON`.
 
 ### Results
 
@@ -212,7 +220,9 @@ BenchmarkBulkInsertTx/batch=1000      18.32ms   1406150 B/op  35446 allocs/op
 Key takeaways:
 - **Traversal cost tracks the reached set**, not the graph size. Each hop is a covering-index lookup, so one hop costs about the same on a 100-node chain and a 10k-node graph.
 - **Dense graph traversal** is the most expensive. `UNION` deduplicates on (node, depth), so a node reachable at several depths is expanded once per depth.
-- **Result decoding** is a large share of big traversals: each node's JSON properties are unmarshaled into a map.
+- **Result decoding** is a large share of big traversals: each node's JSON properties are unmarshaled into a map. `Return` skips it; returning only `name` from a 6-hop traversal with 10-key properties cuts time from 6.3ms to 1.8ms.
+
+[`bench/compare`](bench/compare) benchmarks against [GraphQLite](https://github.com/colliery-io/graphqlite) on 10k-node random and 100k-node power-law graphs.
 - **Name matches** use an index and do not grow with label size.
 
 ## License
