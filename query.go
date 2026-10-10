@@ -2,7 +2,9 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"zombiezen.com/go/sqlite"
@@ -29,24 +31,10 @@ var validOps = map[string]bool{
 	"IS": true, "IS NOT": true,
 }
 
-func validateOp(op string) error {
-	if !validOps[strings.ToUpper(op)] {
-		return fmt.Errorf("graph: invalid operator %q", op)
-	}
-	return nil
-}
-
 // filterCols is the whitelist of node columns Where and WhereRel accept.
 // Column names are written into the SQL text, so nothing else may pass.
 var filterCols = map[string]bool{
 	"id": true, "name": true, "created_at": true, "updated_at": true, "properties": true,
-}
-
-func validateWhere(field, op string) error {
-	if !filterCols[field] {
-		return fmt.Errorf("graph: invalid column %q; use WhereJSON for properties", field)
-	}
-	return validateOp(op)
 }
 
 type whereClause struct {
@@ -54,6 +42,36 @@ type whereClause struct {
 	op     string
 	value  any
 	isJSON bool
+	// elem is a zero value of the slice element type for IN and NOT IN, whose
+	// value is the slice encoded as a JSON array. It picks the property cast.
+	elem any
+}
+
+// newWhere validates a filter on a column, or on a property path if isJSON.
+func newWhere(field, op string, value any, isJSON bool) (whereClause, error) {
+	if !isJSON && !filterCols[field] {
+		return whereClause{}, fmt.Errorf("graph: invalid column %q; use WhereJSON for properties", field)
+	}
+	w := whereClause{field: field, op: strings.ToUpper(op), value: value, isJSON: isJSON}
+	if !validOps[w.op] {
+		return whereClause{}, fmt.Errorf("graph: invalid operator %q", op)
+	}
+	if w.op != "IN" && w.op != "NOT IN" {
+		return w, nil
+	}
+	// The list is bound as one JSON array so the SQL text, and so the
+	// connection's prepared statement cache, does not vary with its length.
+	v := reflect.ValueOf(value)
+	if v.Kind() != reflect.Slice || v.Type().Elem().Kind() == reflect.Uint8 {
+		return whereClause{}, fmt.Errorf("graph: %s requires a slice value, got %T", w.op, value)
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return whereClause{}, fmt.Errorf("graph: encode %s list: %w", w.op, err)
+	}
+	w.value = string(b)
+	w.elem = reflect.Zero(v.Type().Elem()).Interface()
+	return w, nil
 }
 
 type relStep struct {
@@ -74,6 +92,7 @@ type Query struct {
 	wheres     []whereClause
 	rels       []relStep
 	returnCols []string
+	withLabels bool
 	limitVal   int
 	offsetVal  int
 	err        error // captures builder errors
@@ -88,22 +107,24 @@ func (g *Graph) Match(label string) *Query {
 }
 
 // Where adds a column-level filter on the starting node set.
+// IN and NOT IN take a slice value.
 func (q *Query) Where(field, op string, value any) *Query {
-	if err := validateWhere(field, op); err != nil {
-		q.err = err
-		return q
-	}
-	q.wheres = append(q.wheres, whereClause{field: field, op: strings.ToUpper(op), value: value})
-	return q
+	return q.where(field, op, value, false)
 }
 
 // WhereJSON adds a JSON property filter on the starting node set.
+// IN and NOT IN take a slice value.
 func (q *Query) WhereJSON(path, op string, value any) *Query {
-	if err := validateOp(op); err != nil {
+	return q.where(path, op, value, true)
+}
+
+func (q *Query) where(field, op string, value any, isJSON bool) *Query {
+	w, err := newWhere(field, op, value, isJSON)
+	if err != nil {
 		q.err = err
 		return q
 	}
-	q.wheres = append(q.wheres, whereClause{field: path, op: strings.ToUpper(op), value: value, isJSON: true})
+	q.wheres = append(q.wheres, w)
 	return q
 }
 
@@ -162,7 +183,17 @@ func (q *Query) BreadthFirst() *Query {
 
 // WhereRel adds a column filter on nodes reached in the most recent Related() step.
 func (q *Query) WhereRel(field, op string, value any) *Query {
-	if err := validateWhere(field, op); err != nil {
+	return q.whereRel(field, op, value, false)
+}
+
+// WhereRelJSON adds a JSON property filter on nodes reached in the most recent Related() step.
+func (q *Query) WhereRelJSON(path, op string, value any) *Query {
+	return q.whereRel(path, op, value, true)
+}
+
+func (q *Query) whereRel(field, op string, value any, isJSON bool) *Query {
+	w, err := newWhere(field, op, value, isJSON)
+	if err != nil {
 		q.err = err
 		return q
 	}
@@ -171,31 +202,17 @@ func (q *Query) WhereRel(field, op string, value any) *Query {
 		return q
 	}
 	idx := len(q.rels) - 1
-	q.rels[idx].wheres = append(q.rels[idx].wheres, whereClause{field: field, op: strings.ToUpper(op), value: value})
-	return q
-}
-
-// WhereRelJSON adds a JSON property filter on nodes reached in the most recent Related() step.
-func (q *Query) WhereRelJSON(path, op string, value any) *Query {
-	if err := validateOp(op); err != nil {
-		q.err = err
-		return q
-	}
-	if len(q.rels) == 0 {
-		q.err = fmt.Errorf("graph: WhereRelJSON called without a preceding Related()")
-		return q
-	}
-	idx := len(q.rels) - 1
-	q.rels[idx].wheres = append(q.rels[idx].wheres, whereClause{field: path, op: strings.ToUpper(op), value: value, isJSON: true})
+	q.rels[idx].wheres = append(q.rels[idx].wheres, w)
 	return q
 }
 
 // Return specifies which columns/properties to project in results.
-// Known columns (name, created_at, updated_at, properties) map to Node fields.
+// Known columns (name, labels, created_at, updated_at, properties) map to Node fields.
 // Other names are treated as JSON property paths and set in Node.Properties
 // under the name as given; paths missing from a node are omitted. Node.ID is
 // always set. Fields not returned are left zero, and Properties is nil unless
-// properties or a path is returned. Without Return, all columns are returned.
+// properties or a path is returned. Without Return, every field except Labels
+// is returned.
 func (q *Query) Return(cols ...string) *Query {
 	for _, c := range cols {
 		if c == "" {
@@ -204,6 +221,13 @@ func (q *Query) Return(cols ...string) *Query {
 		}
 	}
 	q.returnCols = cols
+	return q
+}
+
+// WithLabels adds Node.Labels to the fields the query returns, whether those
+// are the defaults or the columns named by Return.
+func (q *Query) WithLabels() *Query {
+	q.withLabels = true
 	return q
 }
 

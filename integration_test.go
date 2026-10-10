@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand"
+	"slices"
 	"testing"
 )
 
@@ -107,6 +108,40 @@ func TestMatchWhereJSON(t *testing.T) {
 	}
 	if !containsAll(names, "Charlie", "Eve") {
 		t.Errorf("got %v, expected Charlie and Eve", names)
+	}
+}
+
+func TestWhereIn(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+	buildSocialGraph(t, g)
+
+	cases := []struct {
+		name string
+		q    *Query
+		want []string
+	}{
+		{"column", g.Match("Person").Where("name", "in", []string{"Alice", "Eve", "Nobody"}), []string{"Alice", "Eve"}},
+		{"json ints", g.Match("Person").WhereJSON("age", "IN", []int{25, 40}), []string{"Bob", "Eve"}},
+		{"not in", g.Match("Person").WhereJSON("age", "NOT IN", []any{25, 30, 35}), []string{"Diana", "Eve"}},
+		{"rel", g.Match("Person").Where("name", "=", "Alice").Related("KNOWS", 1, 3).WhereRel("name", "IN", []string{"Bob", "Diana"}), []string{"Bob", "Diana"}},
+		{"empty", g.Match("Person").Where("name", "IN", []string{}), nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := c.q.Run(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			names := nodeNames(res.Nodes())
+			if len(names) != len(c.want) || !containsAll(names, c.want...) {
+				t.Errorf("got %v, want %v", names, c.want)
+			}
+		})
+	}
+
+	if _, err := g.Match("Person").Where("name", "IN", "Alice").Run(ctx); err == nil {
+		t.Error("IN accepted a non-slice value")
 	}
 }
 
@@ -319,6 +354,27 @@ func TestReturn(t *testing.T) {
 		}
 		if len(n.Properties) != 1 || n.Properties["age"] != float64(30) {
 			t.Errorf("properties = %v, want map[age:30]", n.Properties)
+		}
+	}
+
+	if err := g.AddLabels(ctx, alice.ID, "Engineer"); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []*Query{
+		g.Match("Person").Where("name", "=", "Alice").Return("labels"),
+		g.Match("Person").Where("name", "=", "Alice").WithLabels(),
+		g.Match("Person").Where("name", "=", "Alice").Return("name").WithLabels(),
+		g.Match("Company").RelatedDir("WORKS_AT", Incoming, 1, 1).WhereRel("name", "=", "Alice").Return("labels"),
+	} {
+		res, err := q.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.Nodes()[0].Labels; !slices.Equal(got, []string{"Engineer", "Person"}) {
+			t.Errorf("labels = %v, want [Engineer Person]", got)
+		}
+		if q.withLabels && res.Nodes()[0].Name != "Alice" {
+			t.Errorf("WithLabels dropped name: %+v", res.Nodes()[0])
 		}
 	}
 

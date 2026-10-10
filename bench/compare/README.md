@@ -1,6 +1,6 @@
 # Comparison benchmarks
 
-Benchmarks go-sqlite-graph against [GraphQLite](https://github.com/colliery-io/graphqlite), a SQLite extension with Cypher support. This is a separate module because it needs CGo (`mattn/go-sqlite3`) to load the extension.
+Benchmarks go-sqlite-graph against [GraphQLite](https://github.com/colliery-io/graphqlite), a SQLite extension with Cypher support. This is a separate module because it needs CGo (`mattn/go-sqlite3`) to load the extension. The `go.work` file at the repository root builds it against the local copy of go-sqlite-graph.
 
 Each graph is loaded into three engines, and the harness fails if they disagree on any result size:
 

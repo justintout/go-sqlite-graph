@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"zombiezen.com/go/sqlite"
@@ -60,6 +61,18 @@ func (g *Graph) DeleteEdge(ctx context.Context, id int64) error {
 	return deleteEdgeInternal(conn, id)
 }
 
+// EdgesBetween returns the edges whose source and target are both in nodeIDs,
+// in no guaranteed order. With types given, it returns only edges of those
+// types.
+func (g *Graph) EdgesBetween(ctx context.Context, nodeIDs []int64, types ...string) ([]*Edge, error) {
+	conn, err := g.conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer g.put(conn)
+	return edgesBetweenInternal(conn, nodeIDs, types)
+}
+
 func createEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 	props, err := MarshalProperties(e.Properties)
 	if err != nil {
@@ -80,24 +93,33 @@ func createEdgeInternal(conn *sqlite.Conn, e *Edge) error {
 	return nil
 }
 
-func getEdgeInternal(conn *sqlite.Conn, id int64) (*Edge, error) {
-	e := &Edge{ID: id}
-	found := false
+const edgeCols = "e.id, e.source_id, e.target_id, e.type, e.name, e.created_at, e.updated_at, e.properties"
 
+// scanEdge reads a row selected with edgeCols.
+func scanEdge(stmt *sqlite.Stmt) (*Edge, error) {
+	e := &Edge{
+		ID:        stmt.ColumnInt64(0),
+		SourceID:  stmt.ColumnInt64(1),
+		TargetID:  stmt.ColumnInt64(2),
+		Type:      stmt.ColumnText(3),
+		Name:      stmt.ColumnText(4),
+		CreatedAt: stmt.ColumnText(5),
+		UpdatedAt: stmt.ColumnText(6),
+	}
+	var err error
+	e.Properties, err = UnmarshalProperties(stmt.ColumnText(7))
+	return e, err
+}
+
+func getEdgeInternal(conn *sqlite.Conn, id int64) (*Edge, error) {
+	var e *Edge
 	err := sqlitex.Execute(conn,
-		"SELECT source_id, target_id, type, name, created_at, updated_at, properties FROM edges WHERE id = ?;",
+		"SELECT "+edgeCols+" FROM edges e WHERE e.id = ?;",
 		&sqlitex.ExecOptions{
 			Args: []any{id},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
-				found = true
-				e.SourceID = stmt.ColumnInt64(0)
-				e.TargetID = stmt.ColumnInt64(1)
-				e.Type = stmt.ColumnText(2)
-				e.Name = stmt.ColumnText(3)
-				e.CreatedAt = stmt.ColumnText(4)
-				e.UpdatedAt = stmt.ColumnText(5)
 				var err error
-				e.Properties, err = UnmarshalProperties(stmt.ColumnText(6))
+				e, err = scanEdge(stmt)
 				return err
 			},
 		},
@@ -105,11 +127,55 @@ func getEdgeInternal(conn *sqlite.Conn, id int64) (*Edge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("graph: get edge: %w", err)
 	}
-	if !found {
+	if e == nil {
 		return nil, fmt.Errorf("graph: edge %d not found", id)
 	}
-
 	return e, nil
+}
+
+// edgesBetweenInternal binds the ID and type lists as JSON arrays, so the SQL
+// text does not vary with their lengths. Each node's outgoing edges are read
+// from the (source_id, type, target_id) index, and the target is checked
+// against the set. The unary + on target_id stops the planner from seeking
+// the target index once per (source, target) pair, which is quadratic in the
+// number of nodes.
+func edgesBetweenInternal(conn *sqlite.Conn, nodeIDs []int64, types []string) ([]*Edge, error) {
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+	ids, err := json.Marshal(nodeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("graph: encode node IDs: %w", err)
+	}
+	query := "SELECT " + edgeCols + " FROM (SELECT DISTINCT value AS id FROM json_each(?)) s" +
+		" CROSS JOIN edges e ON e.source_id = s.id" +
+		" WHERE +e.target_id IN (SELECT value FROM json_each(?))"
+	args := []any{string(ids), string(ids)}
+	if len(types) > 0 {
+		t, err := json.Marshal(types)
+		if err != nil {
+			return nil, fmt.Errorf("graph: encode edge types: %w", err)
+		}
+		query += " AND e.type IN (SELECT value FROM json_each(?))"
+		args = append(args, string(t))
+	}
+
+	var edges []*Edge
+	err = sqlitex.Execute(conn, query+";", &sqlitex.ExecOptions{
+		Args: args,
+		ResultFunc: func(stmt *sqlite.Stmt) error {
+			e, err := scanEdge(stmt)
+			if err != nil {
+				return err
+			}
+			edges = append(edges, e)
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("graph: edges between: %w", err)
+	}
+	return edges, nil
 }
 
 func updateEdgeInternal(conn *sqlite.Conn, e *Edge) error {

@@ -64,3 +64,53 @@ func TestEdgeCRUD(t *testing.T) {
 		t.Error("expected error getting deleted edge")
 	}
 }
+
+func TestEdgesBetween(t *testing.T) {
+	g := openTestGraph(t)
+	ctx := context.Background()
+
+	var n [3]*Node
+	for i := range n {
+		n[i] = &Node{Name: "n"}
+		if err := g.CreateNode(ctx, n[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range []*Edge{
+		{SourceID: n[0].ID, TargetID: n[1].ID, Type: "KNOWS"},
+		{SourceID: n[1].ID, TargetID: n[0].ID, Type: "LIKES"},
+		{SourceID: n[0].ID, TargetID: n[0].ID, Type: "KNOWS"},
+		{SourceID: n[1].ID, TargetID: n[2].ID, Type: "KNOWS"},
+	} {
+		if err := g.CreateEdge(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ids := []int64{n[0].ID, n[1].ID, n[0].ID}
+	for _, c := range []struct {
+		types []string
+		want  int
+	}{
+		{nil, 3},
+		{[]string{"KNOWS"}, 2},
+		{[]string{"LIKES", "MISSING"}, 1},
+	} {
+		edges, err := g.EdgesBetween(ctx, ids, c.types...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(edges) != c.want {
+			t.Errorf("types %v: got %d edges, want %d", c.types, len(edges), c.want)
+		}
+		for _, e := range edges {
+			if e.TargetID == n[2].ID || e.Properties == nil {
+				t.Errorf("types %v: got %+v", c.types, e)
+			}
+		}
+	}
+
+	if edges, err := g.EdgesBetween(ctx, nil); err != nil || edges != nil {
+		t.Errorf("no IDs: got %v, %v", edges, err)
+	}
+}

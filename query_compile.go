@@ -32,9 +32,15 @@ func (b *sqlBuilder) w(parts ...string) {
 	}
 }
 
+// allCols is the default projection. It omits labels: reading them runs a
+// subquery and decodes a JSON array per node, which made traversals ~40%
+// slower. Return("labels") and WithLabels select them.
 var allCols = []string{"name", "created_at", "updated_at", "properties"}
 
-var knownNodeCols = map[string]bool{"name": true, "created_at": true, "updated_at": true, "properties": true}
+var knownNodeCols = map[string]bool{"name": true, "labels": true, "created_at": true, "updated_at": true, "properties": true}
+
+// labelsExpr selects a node's labels as a JSON array, sorted like GetNode.
+const labelsExpr = "(SELECT json_group_array(label) FROM (SELECT label FROM node_labels WHERE node_id = n.id ORDER BY label))"
 
 // compile builds the SQL for q. With count set, it selects COUNT(*) and
 // ignores Limit and Offset.
@@ -110,9 +116,17 @@ func (c *compiledQuery) writeSelect(b *sqlBuilder, q *Query, count bool) {
 			c.cols = append(c.cols, col)
 		}
 	}
+	if q.withLabels && !slices.Contains(c.cols, "labels") {
+		// Clip so the append copies instead of writing into allCols.
+		c.cols = append(slices.Clip(c.cols), "labels")
+	}
 
 	b.w("SELECT n.id")
 	for _, col := range c.cols {
+		if col == "labels" {
+			b.w(", ", labelsExpr)
+			continue
+		}
 		if knownNodeCols[col] {
 			b.w(", n.", col)
 			continue
@@ -274,14 +288,25 @@ func writeHops(b *sqlBuilder, from string, r relStep, mode hopMode, cond string)
 func writeWheres(b *sqlBuilder, tableAlias string, wheres []whereClause) {
 	for _, w := range wheres {
 		b.w(" AND ")
+		list := w.op == "IN" || w.op == "NOT IN"
 		if w.isJSON {
 			// The path is bound, never interpolated, so any key is safe.
-			b.w(jsonExtractExpr(tableAlias, w.value), " ", w.op, " ?")
-			b.args = append(b.args, "$."+w.field, w.value)
-			continue
+			sample := w.value
+			if list {
+				sample = w.elem
+			}
+			b.w(jsonExtractExpr(tableAlias, sample))
+			b.args = append(b.args, "$."+w.field)
+		} else {
+			// w.field is checked against filterCols.
+			b.w(tableAlias, ".", w.field)
 		}
-		// w.field is checked against filterCols and w.op against validOps.
-		b.w(tableAlias, ".", w.field, " ", w.op, " ?")
+		// w.op is checked against validOps.
+		if list {
+			b.w(" ", w.op, " (SELECT value FROM json_each(?))")
+		} else {
+			b.w(" ", w.op, " ?")
+		}
 		b.args = append(b.args, w.value)
 	}
 }
@@ -312,6 +337,12 @@ func (c *compiledQuery) execute(conn *sqlite.Conn) (*Result, error) {
 				switch col {
 				case "name":
 					n.Name = stmt.ColumnText(i)
+				case "labels":
+					if text := stmt.ColumnText(i); text != "[]" {
+						if err := json.Unmarshal([]byte(text), &n.Labels); err != nil {
+							return fmt.Errorf("graph: decode labels: %w", err)
+						}
+					}
 				case "created_at":
 					n.CreatedAt = stmt.ColumnText(i)
 				case "updated_at":

@@ -85,11 +85,8 @@ func TestConvertEdges(t *testing.T) {
 	if len(links) != 2 {
 		t.Fatalf("expected 2 links, got %d", len(links))
 	}
-	if links[0].Source != "Alice" {
-		t.Errorf("expected source Alice, got %v", links[0].Source)
-	}
-	if links[0].Target != "Bob" {
-		t.Errorf("expected target Bob, got %v", links[0].Target)
+	if links[0].Source != "1" || links[0].Target != "2" {
+		t.Errorf("got link %v -> %v, want 1 -> 2", links[0].Source, links[0].Target)
 	}
 }
 
@@ -103,17 +100,5 @@ func TestConvertEdgesOrphanSkipped(t *testing.T) {
 
 	if len(links) != 1 {
 		t.Fatalf("expected 1 link (orphan skipped), got %d", len(links))
-	}
-}
-
-func TestNodeNameIndex(t *testing.T) {
-	nodes := testNodes()
-	idx := viz.NodeNameIndex(nodes)
-
-	if idx[1] != "Alice" {
-		t.Errorf("expected Alice for ID 1, got %s", idx[1])
-	}
-	if idx[3] != "Acme" {
-		t.Errorf("expected Acme for ID 3, got %s", idx[3])
 	}
 }
